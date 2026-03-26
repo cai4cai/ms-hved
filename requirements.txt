@@ -1,0 +1,21 @@
+torch
+torchvision
+tensorboard
+numpy
+nibabel
+Pillow
+torchviz
+graphviz
+wandb
+monai
+lpips
+transformers
+accelerate
+tqdm
+einops
+# Optional dependencies for visualization
+scipy
+matplotlib
+streamlit
+rich
+gdown

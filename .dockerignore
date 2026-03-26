@@ -1,0 +1,117 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+conda/
+.conda/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-project
+*.sublime-workspace
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+
+# PyTorch
+*.pth
+*.pt
+*.ckpt
+checkpoints/
+models/
+*.model
+
+# Data directories (exclude large datasets)
+data/
+datasets/
+*.nii
+*.nii.gz
+*.npy
+*.npz
+*.h5
+*.hdf5
+
+# Training outputs
+logs/
+runs/
+outputs/
+results/
+experiments/
+wandb/
+tensorboard/
+
+
+# Documentation
+docs/
+*.md
+LICENSE
+README.md
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.dmypy.json
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Temporary files
+*.log
+*.tmp
+tmp/
+temp/
+.cache/
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.travis.yml
+Jenkinsfile
+
+# Scripts (unless needed)
+run.sh
+setup.sh
+*.sh
+
+# CSV files (often contain metadata or results)
+*.csv
+
+# Miscellaneous
+*.bak
+*.orig
+.env
+.env.local

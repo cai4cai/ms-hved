@@ -1,0 +1,1156 @@
+"""
+Training script for MS-HVED Super-Resolution with Orthogonal Stacks
+
+This script trains the MS-HVED model using three orthogonal low-resolution stacks
+generated from high-resolution volumes. Each stack has high resolution in one
+orientation (axial, coronal, sagittal).
+
+Based on the original SynthSR training pipeline with modifications for MS-HVED.
+"""
+
+import os
+import argparse
+import csv
+import time
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.multiprocessing as mp
+from datetime import datetime
+from tqdm import tqdm
+from typing import List
+import wandb
+
+# Accelerate for easy multi-GPU training
+from accelerate import Accelerator
+from accelerate.utils import set_seed
+
+# Transformers imports for scheduler
+from transformers import get_cosine_schedule_with_warmup
+
+# MONAI imports
+from monai.data import DataLoader
+
+# Import our modules
+from src import MSHVEDLoss, create_mshved
+from src.losses import spectral_regularization
+from src.data import HRLRDataGenerator, create_dataset
+from src.utils import (
+    save_model_checkpoint,
+    get_image_paths,
+    save_training_config,
+    find_latest_checkpoint,
+    calculate_metrics,
+)
+
+
+def build_model_config(
+    num_orientations: int,
+    num_scales: int,
+    output_shape: tuple,
+    reconstruct_orientations: bool,
+    decoder_upsample_mode: str,
+    final_activation: str,
+    init_filters: int = None,
+    blocks_down: tuple = None,
+    blocks_up: tuple = None,
+    num_groups: int = None,
+    global_residual: bool = True,
+) -> dict:
+    """Build model configuration dictionary for checkpoint saving."""
+    config = {
+        "num_orientations": num_orientations,
+        "num_scales": num_scales,
+        "output_shape": output_shape,
+        "reconstruct_orientations": reconstruct_orientations,
+        "decoder_upsample_mode": decoder_upsample_mode,
+        "final_activation": final_activation,
+        "init_filters": init_filters,
+        "blocks_down": list(blocks_down),
+        "blocks_up": list(blocks_up),
+        "num_groups": num_groups,
+        "global_residual": global_residual,
+    }
+
+    return config
+
+
+def train_uhved_model(
+    hr_image_paths: List[str],
+    model_dir: str,
+    epochs: int = 100,
+    batch_size: int = 1,
+    learning_rate: float = 1e-4,
+    output_shape: tuple = (128, 128, 128),
+    checkpoint: str = None,
+    device: str = "cuda",
+    save_interval: int = 10,
+    val_interval: int = 1,
+    val_image_paths: List[str] = None,
+    atlas_res: list = [1.0, 1.0, 1.0],
+    min_resolution: list = [1.0, 1.0, 1.0],
+    max_res_aniso: list = [9.0, 9.0, 9.0],
+    randomise_res: bool = True,
+    prob_motion: float = 0.2,
+    prob_spike: float = 0.05,
+    prob_aliasing: float = 0.1,
+    prob_bias_field: float = 0.5,
+    prob_noise: float = 0.8,
+    fov_augmentation_prob: float = 0.7,
+    apply_intensity_aug: bool = True,
+    orientation_dropout_prob: float = 0.0,
+    min_orientations: int = 1,
+    drop_orientations: list = None,
+    balanced_orientation_combos: bool = False,
+    num_workers: int = None,
+    use_cache: bool = False,
+    use_wandb: bool = False,
+    wandb_project: str = "mshved",
+    wandb_entity: str = None,
+    wandb_run_name: str = None,
+    num_scales: int = 4,
+    mixed_precision: str = "no",
+    gradient_accumulation_steps: int = 1,
+    seed: int = 42,
+    recon_loss_type: str = "charbonnier",
+    recon_weight: float = 0.4,
+    kl_weight: float = 0.1,
+    perceptual_weight: float = 0.1,
+    ssim_weight: float = 0.1,
+    orientation_weight: float = 0.4,
+    use_perceptual: bool = False,
+    use_ssim: bool = True,
+    perceptual_network: str = 'alex',
+    is_fake_3d: bool = False,
+    reconstruct_orientations: bool = True,
+    final_activation: str = "clamp",
+    max_grad_norm: float = 1.0,
+    decoder_upsample_mode: str = "trilinear",
+    upsample_mode: str = "trilinear",
+    init_filters: int = 32,
+    blocks_down: list = None,
+    blocks_up: list = None,
+    num_groups: int = 8,
+    global_residual: bool = True,
+    spectral_reg_weight: float = 0.0,
+):
+    """
+    Train MS-HVED model with orthogonal LR stacks
+
+    Args:
+        hr_image_paths: List of paths to high-resolution images
+        model_dir: Directory to save trained models
+        epochs: Number of training epochs
+        batch_size: Batch size
+        learning_rate: Learning rate
+        output_shape: Output volume shape
+        checkpoint: Optional checkpoint to resume from
+        device: 'cuda' or 'cpu'
+        save_interval: Save checkpoint every N epochs
+        val_interval: Run validation every N epochs
+        val_image_paths: Optional list of validation image paths
+        atlas_res: Physical resolution of input HR images [x, y, z] in mm
+        min_resolution: Minimum resolution for randomization
+        max_res_aniso: Maximum anisotropic resolution
+        randomise_res: Whether to randomize resolution
+        prob_motion: Probability of motion artifacts
+        prob_spike: Probability of k-space spikes
+        prob_aliasing: Probability of aliasing artifacts
+        prob_bias_field: Probability of bias field
+        prob_noise: Probability of noise
+        fov_augmentation_prob: Probability of FOV augmentation
+        apply_intensity_aug: Whether to apply intensity augmentation
+        orientation_dropout_prob: Probability of applying orientation dropout (0.0-1.0)
+        min_orientations: Minimum number of orientations to keep after dropout (1-3)
+        drop_orientations: Specific orientations to drop (0=Axial, 1=Coronal, 2=Sagittal). If specified, always drops these.
+        balanced_orientation_combos: Whether to use balanced orientation mask combos per epoch.
+        upsample_mode: Interpolation mode for FFT upsample recovery ('nearest', 'trilinear', 'nearest-exact')
+        num_workers: Number of data loading workers
+        use_cache: Whether to use CacheDataset
+        use_wandb: Whether to use Weights & Biases for tracking
+        wandb_project: W&B project name
+        wandb_entity: W&B entity/team name
+        wandb_run_name: W&B run name
+        num_scales: Number of hierarchical scales
+        mixed_precision: Mixed precision training ('no', 'fp16', 'bf16')
+        gradient_accumulation_steps: Number of steps to accumulate gradients
+        seed: Random seed for reproducibility
+        recon_loss_type: Type of reconstruction loss ('l1', 'l2', or 'charbonnier')
+        recon_weight: Weight for reconstruction loss
+        kl_weight: Weight for KL divergence loss
+        perceptual_weight: Weight for perceptual loss
+        ssim_weight: Weight for SSIM loss
+        orientation_weight: Weight for orientation reconstruction loss
+        use_perceptual: Whether to use perceptual loss
+        use_ssim: Whether to use SSIM loss
+        perceptual_network: MONAI network for perceptual loss ('alex', 'vgg', 'squeeze', 'radimagenet', 'medicalnet', 'resnet50')
+        is_fake_3d: Use 2.5D (fake 3D) mode for perceptual loss (False = full 3D, True = 2.5D slices)
+        final_activation: Final activation function ('tanh', 'sigmoid', or 'none')
+        max_grad_norm: Maximum gradient norm for clipping (0 to disable)
+        decoder_upsample_mode: Decoder upsampling strategy ('trilinear', 'transpose', or 'pixelshuffle')
+    """
+    # Initialize Accelerator for multi-GPU training
+    accelerator = Accelerator(
+        mixed_precision=mixed_precision,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        log_with="wandb" if use_wandb else None,
+    )
+
+    # Set seed for reproducibility
+    set_seed(seed)
+
+    # Only print from main process
+    if accelerator.is_main_process:
+        print("=" * 80)
+        print("Training MS-HVED with Orthogonal LR Stacks")
+        print("=" * 80)
+        print(f"Distributed training: {accelerator.num_processes} process(es)")
+        print(f"Mixed precision: {mixed_precision}")
+        print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
+
+    # Create model directory
+    os.makedirs(model_dir, exist_ok=True)
+
+    # Auto-detect optimal num_workers if not provided
+    if num_workers is None:
+        cpu_count = os.cpu_count() or 1
+        if device == "cuda" and torch.cuda.is_available():
+            num_workers = min(4, max(cpu_count // 2, 1))
+        elif cpu_count >= 4:
+            num_workers = 2
+        else:
+            num_workers = 0
+
+    # Enable pin_memory for faster GPU transfer
+    pin_memory = False  # Accelerate handles this
+
+    if accelerator.is_main_process:
+        print(
+            f"DataLoader settings: num_workers={num_workers}, pin_memory={pin_memory}, use_cache={use_cache}"
+        )
+
+    # Create data generator for orthogonal stacks
+    if accelerator.is_main_process:
+        print(f"Input HR image resolution: {atlas_res} mm")
+        print(f"Resolution randomization: {min_resolution} to {max_res_aniso} mm")
+        print(f"Generating 3 orthogonal LR stacks per HR volume (RAS-oriented)")
+        print(f"  - Stack 0 (Axial): High in-plane (R,A), Low through-plane (S)")
+        print(f"  - Stack 1 (Coronal): High in-plane (R,S), Low through-plane (A)")
+        print(f"  - Stack 2 (Sagittal): High in-plane (A,S), Low through-plane (R)")
+        if orientation_dropout_prob > 0.0:
+            print(f"orientation dropout enabled: {orientation_dropout_prob:.2f} probability, min {min_orientations} orientations")
+            print(f"  → Training will randomly drop views to simulate missing data")
+        if balanced_orientation_combos:
+            print("Balanced orientation combos enabled per epoch")
+
+    generator = HRLRDataGenerator(
+        atlas_res=atlas_res,
+        target_res=[1.0, 1.0, 1.0],
+        output_shape=list(output_shape),
+        min_resolution=min_resolution,
+        max_res_aniso=max_res_aniso,
+        randomise_res=randomise_res,
+        prob_motion=prob_motion,
+        prob_spike=prob_spike,
+        prob_aliasing=prob_aliasing,
+        prob_bias_field=prob_bias_field,
+        prob_noise=prob_noise,
+        fov_augmentation_prob=fov_augmentation_prob,
+        apply_intensity_aug=apply_intensity_aug,
+        clip_to_unit_range=True,
+        orientation_dropout_prob=orientation_dropout_prob,
+        min_orientations=min_orientations,
+        drop_orientations=drop_orientations,
+        upsample_mode=upsample_mode,
+        return_intermediate=False
+    )
+
+    # Create dataset
+    dataset = create_dataset(
+        image_paths=hr_image_paths,
+        generator=generator,
+        target_shape=list(output_shape),
+        target_spacing=atlas_res,
+        use_cache=use_cache,
+        return_resolution=True,
+        is_training=True,
+        balanced_orientation_combos=balanced_orientation_combos,
+    )
+
+    # Create DataLoader
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=(num_workers > 0),
+    )
+
+    if accelerator.is_main_process:
+        print(f"Training dataset: {len(dataset)} images")
+
+    # Create validation dataset if provided
+    val_dataloader = None
+    if val_image_paths:
+        val_dataset = create_dataset(
+            image_paths=val_image_paths,
+            generator=generator,
+            target_shape=list(output_shape),
+            target_spacing=atlas_res,
+            use_cache=use_cache,
+            return_resolution=True,
+            is_training=False,
+            balanced_orientation_combos=False,
+        )
+
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=(num_workers > 0),
+        )
+        if accelerator.is_main_process:
+            print(f"Validation dataset: {len(val_dataset)} images")
+
+    # Auto-detect checkpoint
+    start_epoch = 0
+    checkpoint_data = None
+
+    if checkpoint is None:
+        checkpoint = find_latest_checkpoint(model_dir)
+        if checkpoint and accelerator.is_main_process:
+            print(f"Auto-detected checkpoint: {checkpoint}")
+
+    # Load checkpoint if available
+    if checkpoint and os.path.exists(checkpoint):
+        if accelerator.is_main_process:
+            print(f"Loading checkpoint from {checkpoint}")
+        checkpoint_data = torch.load(checkpoint, map_location="cpu")
+        start_epoch = checkpoint_data.get("epoch", 0) + 1
+        if accelerator.is_main_process:
+            print(f"Resuming training from epoch {start_epoch}")
+
+    # Create MS-HVED model
+    if accelerator.is_main_process:
+        print(f"Creating MS-HVED model:")
+        print(f"  - Number of orientations: 3 (orthogonal stacks)")
+        print(f"  - Number of scales: {num_scales}")
+        print(f"  - Final activation: {final_activation}")
+        print(f"  - Init filters: {init_filters}")
+        print(f"  - Blocks down: {blocks_down}")
+        print(f"  - Blocks up: {blocks_up}")
+        print(f"  - Num groups: {num_groups}")
+
+    # Other parameters for architectures
+    other_params = {
+        'num_orientations': 3,
+        'in_channels': 1,
+        'out_channels': 1,
+        'num_scales': num_scales,
+        'share_encoder': False,
+        'share_decoder': False,
+        'use_prior': True,
+        'reconstruct_orientations': reconstruct_orientations,
+        'final_activation': final_activation,
+        'upsample_mode': decoder_upsample_mode,
+        'global_residual': global_residual,
+    }
+
+    model = create_mshved(
+        config='default',
+        init_filters=init_filters,
+        blocks_down=tuple(blocks_down),
+        blocks_up=tuple(blocks_up),
+        num_groups=num_groups,
+        **other_params
+    )
+
+    # Load checkpoint weights if available
+    if checkpoint_data is not None:
+        model.load_state_dict(checkpoint_data["model_state_dict"])
+        if accelerator.is_main_process:
+            print(f"✓ Loaded model weights from checkpoint")
+
+    # Optimizer and loss - Add weight decay to prevent unbounded weight growth
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-5)
+
+    criterion = MSHVEDLoss(
+        recon_loss_type=recon_loss_type,
+        recon_weight=recon_weight,
+        kl_weight=kl_weight,
+        perceptual_weight=perceptual_weight,
+        ssim_weight=ssim_weight,
+        orientation_weight=orientation_weight,
+        use_perceptual=use_perceptual,
+        use_ssim=use_ssim,
+        perceptual_network=perceptual_network,
+        is_fake_3d=is_fake_3d,
+    )
+
+    if accelerator.is_main_process:
+        sr_str = f", spectral_reg={spectral_reg_weight}" if spectral_reg_weight > 0 else ""
+        print(f"Loss weights: recon={recon_weight}, kl={kl_weight}, perceptual={perceptual_weight}, orientation={orientation_weight}{sr_str}")
+
+    # Calculate total training steps for scheduler
+    num_steps = len(dataloader) * epochs
+    warmup_steps = int(0.05 * num_steps)  # 5% warmup
+
+    # Learning rate scheduler
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=num_steps,
+    )
+
+    if accelerator.is_main_process:
+        print(f"Using Cosine LR schedule with warmup ({warmup_steps} warmup steps, {num_steps} total steps)")
+        if max_grad_norm > 0:
+            print(f"Gradient clipping enabled: max_norm={max_grad_norm}")
+        else:
+            print(f"Gradient clipping disabled")
+
+    # Load optimizer and scheduler state if resuming
+    if checkpoint_data is not None:
+        if "optimizer_state_dict" in checkpoint_data:
+            optimizer.load_state_dict(checkpoint_data["optimizer_state_dict"])
+        if "scheduler_state_dict" in checkpoint_data:
+            scheduler.load_state_dict(checkpoint_data["scheduler_state_dict"])
+
+    # Prepare everything with accelerator
+    model, optimizer, dataloader, scheduler = accelerator.prepare(
+        model, optimizer, dataloader, scheduler
+    )
+
+    if val_dataloader is not None:
+        val_dataloader = accelerator.prepare(val_dataloader)
+
+    # Track best validation loss for saving best model
+    best_val_loss = float('inf')
+    if checkpoint_data is not None and 'val_loss' in checkpoint_data and checkpoint_data['val_loss'] is not None:
+        best_val_loss = checkpoint_data['val_loss']
+        if accelerator.is_main_process:
+            print(f"Best validation loss from checkpoint: {best_val_loss:.4f}")
+
+    # Initialize Weights & Biases if enabled
+    if use_wandb and accelerator.is_main_process:
+        wandb_config = {
+            "num_orientations": 3,
+            "num_scales": num_scales,
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "learning_rate": learning_rate,
+            "output_shape": output_shape,
+            "kl_weight": kl_weight,
+            "perceptual_weight": perceptual_weight,
+            "orientation_weight": orientation_weight,
+            "balanced_orientation_combos": balanced_orientation_combos,
+            "reconstruct_orientations": reconstruct_orientations,
+            "model_parameters": sum(p.numel() for p in model.parameters()),
+            "n_train_samples": len(hr_image_paths),
+            "n_val_samples": len(val_image_paths) if val_image_paths else 0,
+            "init_filters": init_filters,
+            "blocks_down": blocks_down,
+            "blocks_up": blocks_up,
+            "num_groups": num_groups,
+        }
+
+        wandb.init(
+            project=wandb_project,
+            entity=wandb_entity,
+            name=wandb_run_name,
+            config=wandb_config,
+            resume="allow" if checkpoint else False,
+        )
+        wandb.watch(model, criterion, log="all", log_freq=100)
+        print(f"Weights & Biases initialized: {wandb.run.name}")
+
+    # Setup CSV logging
+    csv_file = None
+    csv_writer = None
+    if accelerator.is_main_process:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_filename = f"training_log_{timestamp}.csv"
+        csv_path = os.path.join(model_dir, csv_filename)
+
+        csv_headers = ["epoch", "train_loss", "train_recon", "train_kl", "train_ssim", "train_perceptual", "train_orientation",
+                        "learning_rate", "epoch_time"]
+        if val_dataloader:
+            csv_headers.extend([
+                "val_loss", "val_recon", "val_kl", "val_ssim_loss", "val_perceptual", "val_orientation",
+                "val_mae", "val_mse", "val_rmse", "val_psnr", "val_r2", "val_ssim", "validation_time"
+            ])
+
+        csv_file = open(csv_path, mode='a', newline='')
+        csv_writer = csv.DictWriter(csv_file, fieldnames=csv_headers)
+        csv_writer.writeheader()
+        csv_file.flush()
+        print(f"Logging training metrics to: {csv_path}")
+
+    # Training loop
+    for epoch in range(start_epoch, epochs):
+        epoch_start_time = time.time()
+        if hasattr(dataloader.dataset, "set_epoch"):
+            dataloader.dataset.set_epoch(epoch)
+        model.train()
+        epoch_loss = 0.0
+        epoch_recon_loss = 0.0
+        epoch_kl_loss = 0.0
+        epoch_ssim_loss = 0.0
+        epoch_perceptual_loss = 0.0
+        epoch_orientation_loss = 0.0
+        epoch_spectral_loss = 0.0
+
+        pbar = tqdm(
+            dataloader,
+            desc=f"Epoch {epoch + 1}/{epochs}",
+            disable=not accelerator.is_main_process,
+            leave=False,  
+            dynamic_ncols=True,  
+        )
+
+        for batch_idx, batch_data in enumerate(pbar):
+            # Unpack batch: (lr_stacks_list, hr, resolutions_list, thicknesses_list, orientation_mask, spatial_masks, interp_masks)
+            lr_stacks_list, target_img, resolutions_list, thicknesses_list, orientation_mask, spatial_masks, interp_masks = batch_data
+            orientations = lr_stacks_list
+
+            # Ensure consistent dtype
+            orientations = [m.float() for m in orientations]
+            target_img = target_img.float()
+
+            # Forward and backward pass
+            with accelerator.accumulate(model):
+                outputs = model(orientations, orientation_mask=orientation_mask, interp_masks=interp_masks)
+
+                # Compute loss
+                losses = criterion(
+                    sr_output=outputs['sr_output'],
+                    sr_target=target_img,
+                    posteriors=outputs['posteriors'],
+                    orientation_outputs=outputs.get('orientation_outputs'),
+                    orientation_targets=orientations,
+                    return_components=True
+                )
+
+                loss = losses['total']
+
+                # Spectral regularization: bound encoder Lipschitz constant (NVAE)
+                if spectral_reg_weight > 0:
+                    sr_loss = spectral_regularization(model)
+                    losses['spectral_reg'] = sr_loss * spectral_reg_weight
+                    loss = loss + losses['spectral_reg']
+                    losses['total'] = loss
+
+                # NaN/Inf detection: skip corrupted batches
+                if torch.isnan(loss) or torch.isinf(loss):
+                    if accelerator.is_main_process:
+                        components = {k: v.item() if torch.is_tensor(v) else v for k, v in losses.items()}
+                        print(f"WARNING: NaN/Inf loss at batch {batch_idx}. Components: {components}. Skipping batch.")
+                    optimizer.zero_grad()
+                    continue
+
+                # Backward pass
+                optimizer.zero_grad()
+                accelerator.backward(loss)
+
+                # Gradient clipping (works with both Accelerate and single GPU)
+                if max_grad_norm > 0:
+                    if accelerator.sync_gradients:
+                        # Multi-GPU: Use Accelerate's method
+                        accelerator.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+                    else:
+                        # Single GPU or no sync needed: Use PyTorch's method
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+
+                optimizer.step()
+                scheduler.step()
+
+            epoch_loss += loss.item()
+
+            epoch_recon_loss += losses['reconstruction'].item()
+            epoch_kl_loss += losses['kl'].item()
+            epoch_ssim_loss += losses['ssim'].item() if 'ssim' in losses else 0.0
+            epoch_perceptual_loss += losses['perceptual'].item() if 'perceptual' in losses else 0.0
+            epoch_orientation_loss += losses['orientation'].item() if 'orientation' in losses else 0.0
+            epoch_spectral_loss += losses['spectral_reg'].item() if 'spectral_reg' in losses else 0.0
+
+            # Update progress bar with loss and memory
+            current_lr = optimizer.param_groups[0]['lr']
+            postfix_dict = {
+                "loss": f"{loss.item():.4f}",
+                "recon": f"{losses['reconstruction'].item():.4f}",
+                "kl": f"{losses['kl'].item():.4f}",
+                "ssim": f"{losses['ssim'].item():.4f}" if 'ssim' in losses else "N/A",
+                "perceptual": f"{losses['perceptual'].item():.4f}" if 'perceptual' in losses else "N/A",
+                "orientation": f"{losses['orientation'].item():.4f}" if 'orientation' in losses else "N/A",
+                "lr": f"{current_lr:.2e}"
+            }
+
+            pbar.set_postfix(postfix_dict)
+
+
+        avg_loss = epoch_loss / len(dataloader)
+        avg_recon = epoch_recon_loss / len(dataloader)
+        avg_kl = epoch_kl_loss / len(dataloader)
+        avg_ssim = epoch_ssim_loss / len(dataloader) if epoch_ssim_loss > 0 else 0.0
+        avg_perceptual = epoch_perceptual_loss / len(dataloader) if epoch_perceptual_loss > 0 else 0.0
+        avg_orientation = epoch_orientation_loss / len(dataloader) if epoch_orientation_loss > 0 else 0.0
+
+        # Validation
+        val_loss = None
+        val_metrics = None
+        validation_time = 0.0
+
+        if val_dataloader and (epoch + 1) % val_interval == 0:
+            val_start_time = time.time()
+            model.eval()
+            val_epoch_loss = 0.0
+            metrics_sum = {"mae": 0.0, "mse": 0.0, "rmse": 0.0, "psnr": 0.0, "r2": 0.0, "ssim": 0.0}
+            num_val_batches = 0
+            val_recon_losses = 0.0
+            val_kl_losses = 0.0
+            val_ssim_losses = 0.0
+            val_perceptual_losses = 0.0
+            val_orientation_losses = 0.0
+
+            with torch.no_grad():
+                for val_batch_data in val_dataloader:
+                    lr_stacks_list, target_img, _, _, orientation_mask, spatial_masks, interp_masks = val_batch_data
+                    orientations = [m.float() for m in lr_stacks_list]
+                    target_img = target_img.float()
+
+                    # Pass orientation_mask and interp_masks to the model's fusion mechanism
+                    outputs = model(orientations, orientation_mask=orientation_mask, interp_masks=interp_masks)
+
+                    losses = criterion(
+                        sr_output=outputs['sr_output'],
+                        sr_target=target_img,
+                        posteriors=outputs['posteriors'],
+                        orientation_outputs=outputs.get('orientation_outputs'),
+                        orientation_targets=orientations,
+                        return_components=True
+                    )
+
+                    val_epoch_loss += losses['total'].item()
+                    val_recon_losses += losses['reconstruction'].item()
+                    val_kl_losses += losses['kl'].item()
+                    val_ssim_losses += losses['ssim'].item()
+                    val_perceptual_losses += losses['perceptual'].item()
+                    val_orientation_losses += losses['orientation'].item()
+
+                    # Calculate metrics
+                    batch_metrics = calculate_metrics(outputs['sr_output'], target_img, max_val=1.0)
+                    for key in metrics_sum:
+                        metrics_sum[key] += batch_metrics[key]
+                    num_val_batches += 1
+
+            val_loss = val_epoch_loss / num_val_batches
+            val_metrics = {k: v / num_val_batches for k, v in metrics_sum.items()}
+            val_loss_components = {
+                'val_recon': val_recon_losses / num_val_batches,
+                'val_kl': val_kl_losses / num_val_batches,
+                'val_ssim_loss': val_ssim_losses / num_val_batches,
+                'val_perceptual': val_perceptual_losses / num_val_batches,
+                'val_orientation': val_orientation_losses / num_val_batches,
+            }
+            validation_time = time.time() - val_start_time
+
+            epoch_time = time.time() - epoch_start_time
+            # Print validation results 
+            accelerator.print(
+                f"Epoch {epoch + 1}/{epochs} - Train Loss: {avg_loss:.4f} "
+                f"(Recon: {avg_recon:.4f}, KL: {avg_kl:.6f}, SSIM: {avg_ssim:.4f}, Percep: {avg_perceptual:.4f}, Orient: {avg_orientation:.4f})"
+            )
+            accelerator.print(
+                f"  Val Loss: {val_loss:.4f} "
+                f"(Recon: {val_loss_components['val_recon']:.4f}, KL: {val_loss_components['val_kl']:.6f}, "
+                f"SSIM: {val_loss_components['val_ssim_loss']:.4f}, Percep: {val_loss_components['val_perceptual']:.4f}, "
+                f"Orient: {val_loss_components['val_orientation']:.4f})"
+            )
+            accelerator.print(
+                f"  Val Metrics - MAE: {val_metrics['mae']:.4f} | RMSE: {val_metrics['rmse']:.4f} | "
+                f"PSNR: {val_metrics['psnr']:.2f} dB | SSIM: {val_metrics['ssim']:.4f} | "
+                f"R²: {val_metrics['r2']:.4f} | LR: {current_lr:.2e}"
+            )
+        else:
+            epoch_time = time.time() - epoch_start_time
+            # Print training summary 
+            accelerator.print(
+                f"Epoch {epoch + 1}/{epochs} - Loss: {avg_loss:.4f} "
+                f"(Recon: {avg_recon:.4f}, KL: {avg_kl:.6f}, SSIM: {avg_ssim:.4f}, Percep: {avg_perceptual:.4f}, orientation: {avg_orientation:.4f}) - LR: {current_lr:.2e}"
+            )
+
+        # Log to CSV
+        if accelerator.is_main_process and csv_writer is not None:
+            log_data = {
+                "epoch": epoch + 1,
+                "train_loss": avg_loss,
+                "train_recon": avg_recon,
+                "train_kl": avg_kl,
+                "train_ssim": avg_ssim,
+                "train_perceptual": avg_perceptual,
+                "train_orientation": avg_orientation,
+                "learning_rate": current_lr,
+                "epoch_time": epoch_time,
+            }
+            if val_loss is not None and val_metrics is not None:
+                log_data.update({
+                    "val_loss": val_loss,
+                    "val_recon": val_loss_components['val_recon'],
+                    "val_kl": val_loss_components['val_kl'],
+                    "val_ssim_loss": val_loss_components['val_ssim_loss'],
+                    "val_perceptual": val_loss_components['val_perceptual'],
+                    "val_orientation": val_loss_components['val_orientation'],
+                    "val_mae": val_metrics['mae'],
+                    "val_mse": val_metrics['mse'],
+                    "val_rmse": val_metrics['rmse'],
+                    "val_psnr": val_metrics['psnr'],
+                    "val_r2": val_metrics['r2'],
+                    "val_ssim": val_metrics['ssim'],
+                    "validation_time": validation_time,
+                })
+            csv_writer.writerow(log_data)
+            csv_file.flush()
+
+        # Log to W&B
+        if use_wandb and accelerator.is_main_process:
+            wandb_log_data = {
+                "epoch": epoch + 1,
+                "train/loss": avg_loss,
+                "train/reconstruction": avg_recon,
+                "train/kl": avg_kl,
+                "train/ssim": avg_ssim,
+                "train/perceptual": avg_perceptual,
+                "train/orientation": avg_orientation,
+                "train/learning_rate": current_lr,
+            }
+            if val_loss is not None and val_metrics is not None:
+                wandb_log_data.update({
+                    "val/loss": val_loss,
+                    "val/recon": val_loss_components['val_recon'],
+                    "val/kl": val_loss_components['val_kl'],
+                    "val/ssim_loss": val_loss_components['val_ssim_loss'],
+                    "val/perceptual": val_loss_components['val_perceptual'],
+                    "val/orientation": val_loss_components['val_orientation'],
+                    "val/mae": val_metrics['mae'],
+                    "val/mse": val_metrics['mse'],
+                    "val/rmse": val_metrics['rmse'],
+                    "val/psnr": val_metrics['psnr'],
+                    "val/r2": val_metrics['r2'],
+                    "val/ssim": val_metrics['ssim'],
+                })
+            wandb.log(wandb_log_data)
+
+        # Save best model if validation loss improved
+        if val_loss is not None and val_loss < best_val_loss:
+            best_val_loss = val_loss
+            accelerator.wait_for_everyone()
+            if accelerator.is_main_process:
+                best_model_path = os.path.join(model_dir, "mshved_orthogonal_best.pth")
+
+                model_config = build_model_config(
+                    num_orientations=3,
+                    num_scales=num_scales,
+                    output_shape=output_shape,
+                    reconstruct_orientations=reconstruct_orientations,
+                    decoder_upsample_mode=decoder_upsample_mode,
+                    final_activation=final_activation,
+                    init_filters=init_filters,
+                    blocks_down=tuple(blocks_down) if blocks_down else None,
+                    blocks_up=tuple(blocks_up) if blocks_up else None,
+                    num_groups=num_groups,
+                    global_residual=global_residual,
+                )
+
+                training_config = {
+                    "learning_rate": learning_rate,
+                    "kl_weight": kl_weight,
+                    "recon_weight": recon_weight,
+                    "ssim_weight": ssim_weight,
+                    "perceptual_weight": perceptual_weight,
+                    "perceptual_network": perceptual_network,
+                    "is_fake_3d": is_fake_3d,
+                    "orientation_weight": orientation_weight,
+                    "balanced_orientation_combos": balanced_orientation_combos,
+                }
+
+                unwrapped_model = accelerator.unwrap_model(model)
+                save_model_checkpoint(
+                    filepath=best_model_path,
+                    model=unwrapped_model,
+                    optimizer=optimizer,
+                    epoch=epoch,
+                    loss=avg_loss,
+                    val_loss=val_loss,
+                    model_type="mshved",
+                    model_config=model_config,
+                    scheduler_state_dict=scheduler.state_dict(),
+                    val_metrics=val_metrics,
+                    training_config=training_config,
+                )
+                accelerator.print(f"✓ Saved best model (val_loss: {val_loss:.4f}): {best_model_path}")
+
+        # Save checkpoint
+        if (epoch + 1) % save_interval == 0:
+            accelerator.wait_for_everyone()
+            if accelerator.is_main_process:
+                checkpoint_path = os.path.join(
+                    model_dir, f"mshved_orthogonal_epoch_{epoch + 1:04d}.pth"
+                )
+
+                model_config = build_model_config(
+                    num_orientations=3,
+                    num_scales=num_scales,
+                    output_shape=output_shape,
+                    reconstruct_orientations=reconstruct_orientations,
+                    decoder_upsample_mode=decoder_upsample_mode,
+                    final_activation=final_activation,
+                    init_filters=init_filters,
+                    blocks_down=tuple(blocks_down) if blocks_down else None,
+                    blocks_up=tuple(blocks_up) if blocks_up else None,
+                    num_groups=num_groups,
+                    global_residual=global_residual,
+                )
+
+                training_config = {
+                    "learning_rate": learning_rate,
+                    "kl_weight": kl_weight,
+                    "recon_weight": recon_weight,
+                    "ssim_weight": ssim_weight,
+                    "perceptual_weight": perceptual_weight,
+                    "perceptual_network": perceptual_network,
+                    "is_fake_3d": is_fake_3d,
+                    "orientation_weight": orientation_weight,
+                    "balanced_orientation_combos": balanced_orientation_combos,
+                }
+
+                unwrapped_model = accelerator.unwrap_model(model)
+                save_model_checkpoint(
+                    filepath=checkpoint_path,
+                    model=unwrapped_model,
+                    optimizer=optimizer,
+                    epoch=epoch,
+                    loss=avg_loss,
+                    val_loss=val_loss,
+                    model_type="mshved",
+                    model_config=model_config,
+                    scheduler_state_dict=scheduler.state_dict(),
+                    val_metrics=val_metrics,
+                    training_config=training_config,
+                )
+                accelerator.print(f"Saved checkpoint: {checkpoint_path}")
+
+    # Close CSV file
+    if accelerator.is_main_process and csv_file is not None:
+        csv_file.close()
+
+    # Save final model
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        final_path = os.path.join(model_dir, "mshved_orthogonal_final.pth")
+        model_config = build_model_config(
+            num_orientations=3,
+            num_scales=num_scales,
+            output_shape=output_shape,
+            reconstruct_orientations=reconstruct_orientations,
+            decoder_upsample_mode=decoder_upsample_mode,
+            final_activation=final_activation,
+            init_filters=init_filters,
+            blocks_down=tuple(blocks_down) if blocks_down else None,
+            blocks_up=tuple(blocks_up) if blocks_up else None,
+            num_groups=num_groups,
+            global_residual=global_residual,
+        )
+
+        training_config = {
+            "learning_rate": learning_rate,
+            "kl_weight": kl_weight,
+            "recon_weight": recon_weight,
+            "ssim_weight": ssim_weight,
+            "perceptual_weight": perceptual_weight,
+            "perceptual_network": perceptual_network,
+            "is_fake_3d": is_fake_3d,
+            "orientation_weight": orientation_weight,
+            "balanced_orientation_combos": balanced_orientation_combos,
+        }
+
+        unwrapped_model = accelerator.unwrap_model(model)
+        save_model_checkpoint(
+            filepath=final_path,
+            model=unwrapped_model,
+            optimizer=optimizer,
+            epoch=epochs - 1,
+            loss=avg_loss,
+            val_loss=val_loss,
+            model_type="mshved",
+            model_config=model_config,
+            scheduler_state_dict=scheduler.state_dict(),
+            val_metrics=val_metrics,
+            training_config=training_config,
+        )
+        print(f"Training complete! Final model saved to: {final_path}")
+        if best_val_loss < float('inf'):
+            print(f"Best validation loss: {best_val_loss:.4f}")
+
+
+        if use_wandb:
+            artifact = wandb.Artifact(
+                name=f"model-{wandb.run.id}",
+                type="model",
+                description="Final trained MS-HVED model with orthogonal stacks",
+            )
+            artifact.add_file(final_path)
+            wandb.log_artifact(artifact)
+            wandb.finish()
+
+    accelerator.end_training()
+
+
+if __name__ == "__main__":
+    # Set multiprocessing start method
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
+
+    parser = argparse.ArgumentParser(description="Train MS-HVED with Orthogonal LR Stacks")
+
+    # Training data arguments
+    parser.add_argument("--hr_image_dir", type=str, default=None, help="Directory containing HR images")
+    parser.add_argument("--csv_file", type=str, default=None, help="CSV file with image metadata")
+    parser.add_argument("--base_dir", type=str, default=None, help="Base directory for CSV paths")
+    parser.add_argument("--model_dir", type=str, required=True, help="Directory to save models")
+    parser.add_argument("--val_image_dir", type=str, default=None, help="Validation images directory")
+    parser.add_argument("--mri_classes", type=str, nargs="+", default=None,
+                       help="MRI classifications to include (e.g., T1 T2 FLAIR). Only for CSV mode")
+    parser.add_argument("--acquisition_types", type=str, nargs="+", default=["3D"],
+                       help="Acquisition types to include (e.g., 3D 2D). Use 'all' for all types. Default: 3D only")
+    parser.add_argument("--no_filter_4d", action="store_true",
+                       help="Don't filter out 4D images (with time dimension)")
+
+    # Model parameters
+    parser.add_argument("--num_scales", type=int, default=4, help="Number of hierarchical scales")
+    parser.add_argument("--final_activation", type=str, default="clamp", choices=["clamp", "sigmoid", "tanh", "none"],
+                        help="Final activation function")
+    parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Max gradient norm for clipping (0 to disable)")
+    parser.add_argument("--decoder_upsample_mode", type=str, default="trilinear",
+                        choices=["trilinear", "transpose", "pixelshuffle"],
+                        help="Decoder upsampling strategy: trilinear (interpolation+conv), "
+                             "transpose (transposed conv), or pixelshuffle (sub-pixel conv)")
+    parser.add_argument("--init_filters", type=int, default=32,
+                        help="Initial filter count (default: 32)")
+    parser.add_argument("--blocks_down", type=int, nargs='+', default=[1, 2, 2, 4],
+                        help="Residual blocks per encoder scale")
+    parser.add_argument("--blocks_up", type=int, nargs='+', default=[1, 1, 1],
+                        help="Residual blocks per decoder scale")
+    parser.add_argument("--num_groups", type=int, default=8,
+                        help="Number of groups for GroupNorm (default: 8)")
+    parser.add_argument("--no_reconstruct_orientations", action="store_true",
+                        help="Disable orientation reconstruction (SR decoder only, for ablation studies)")
+    parser.add_argument("--no_global_residual", action="store_true",
+                        help="Disable global residual learning (network predicts full output instead of residual)")
+
+    # Training parameters
+    parser.add_argument("--epochs", type=int, default=100, help="Number of epochs")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
+    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--output_shape", type=int, nargs=3, default=[128, 128, 128], help="Output shape")
+
+    # Loss parameters and weights
+    parser.add_argument("--recon_loss_type", type=str, default="charbonnier", choices=["l1", "l2", "charbonnier"],
+                        help="Reconstruction loss type")
+    parser.add_argument("--recon_weight", type=float, default=0.4, help="Reconstruction loss weight")
+    parser.add_argument("--kl_weight", type=float, default=0.1, help="KL divergence weight")
+    parser.add_argument("--perceptual_weight", type=float, default=0.1, help="Perceptual loss weight")
+    parser.add_argument("--ssim_weight", type=float, default=0.1, help="SSIM loss weight")
+    parser.add_argument("--orientation_weight", type=float, default=0.4, help="orientation reconstruction weight")
+    parser.add_argument("--use_perceptual", action="store_true", help="Use perceptual loss")
+    parser.add_argument("--use_ssim", action="store_true", help="Use SSIM loss")
+    parser.add_argument("--perceptual_network", type=str, default="alex",
+                        choices=["alex", "vgg", "squeeze", "radimagenet", "medicalnet", "resnet50"],
+                        help="Perceptual loss network (MONAI). Options: alex (default, fast LPIPS), "
+                             "vgg, squeeze, radimagenet (RadImageNet ResNet-50), "
+                             "medicalnet (MedicalNet ResNet-10), resnet50")
+    parser.add_argument("--is_fake_3d", action="store_true",
+                        help="Use 2.5D (fake 3D) mode for perceptual loss (faster, lower memory)")
+    parser.add_argument("--spectral_reg_weight", type=float, default=0.0,
+                        help="Weight for spectral regularization on encoder conv layers (NVAE). "
+                             "Constrains encoder Lipschitz constant to bound KL scale. "
+                             "Recommended: 1e-4 to 1e-3. Default: 0.0 (disabled)")
+
+    # Data generation parameters
+    parser.add_argument("--atlas_res", type=float, nargs=3, default=[1.0, 1.0, 1.0], help="HR resolution")
+    parser.add_argument("--min_resolution", type=float, nargs=3, default=[1.0, 1.0, 1.0], help="Min resolution")
+    parser.add_argument("--max_res_aniso", type=float, nargs=3, default=[9.0, 9.0, 9.0], help="Max aniso resolution")
+    parser.add_argument("--no_randomise_res", action="store_true", help="Disable resolution randomization")
+    parser.add_argument("--prob_motion", type=float, default=0.5, help="Probability of motion artifacts")
+    parser.add_argument("--prob_spike", type=float, default=0.5, help="Probability of k-space spikes")
+    parser.add_argument("--prob_aliasing", type=float, default=0.02, help="Probability of aliasing")
+    parser.add_argument("--prob_bias_field", type=float, default=0.5, help="Probability of bias field")
+    parser.add_argument("--prob_noise", type=float, default=0.8, help="Probability of noise")
+    parser.add_argument("--fov_augmentation_prob", type=float, default=0.7, help="Probability of FOV augmentation")
+    parser.add_argument("--no_intensity_aug", action="store_true", help="Disable intensity augmentation")
+
+    # orientation dropout (for robust training with missing views)
+    parser.add_argument("--orientation_dropout_prob", type=float, default=0.0,
+                        help="Probability of applying orientation dropout (0.0-1.0). "
+                             "Randomly drops 1-2 orthogonal views to simulate missing data during inference. "
+                             "Default: 0.0 (no dropout)")
+    parser.add_argument("--min_orientations", type=int, default=1,
+                        help="Minimum number of orientations to keep after dropout (1-3). "
+                             "Default: 1 (allows training with single views)")
+    parser.add_argument("--drop_orientations", type=int, nargs="+", default=None,
+                        choices=[0, 1, 2],
+                        help="Specific orientations to drop (0=Axial, 1=Coronal, 2=Sagittal). "
+                             "If specified, these orientations will ALWAYS be dropped. "
+                             "Mutually exclusive with random orientation_dropout_prob.")
+    parser.add_argument(
+        "--balanced_orientation_combos",
+        action="store_true",
+        help="Use balanced orientation mask combos per epoch for training.",
+    )
+    parser.add_argument("--upsample_mode", type=str, default="trilinear",
+                        choices=["nearest", "trilinear", "nearest-exact"],
+                        help="Interpolation mode for FFT upsample recovery (default: nearest)")
+
+    # Other parameters
+    parser.add_argument("--device", type=str, default="cuda", help="Device")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Checkpoint to resume from")
+    parser.add_argument("--save_interval", type=int, default=10, help="Save every N epochs")
+    parser.add_argument("--val_interval", type=int, default=1, help="Validate every N epochs")
+    parser.add_argument("--num_workers", type=int, default=None, help="Number of workers")
+    parser.add_argument("--use_cache", action="store_true", help="Use MONAI CacheDataset")
+    parser.add_argument("--use_wandb", action="store_true", help="Use Weights & Biases")
+    parser.add_argument("--wandb_project", type=str, default="mshved", help="W&B project")
+    parser.add_argument("--wandb_entity", type=str, default=None, help="W&B entity")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="W&B run name")
+    parser.add_argument("--mixed_precision", type=str, default="no", choices=["no", "fp16", "bf16"])
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+
+    args = parser.parse_args()
+
+    # Process acquisition_types: convert "all" to None for the function
+    acquisition_types = args.acquisition_types
+    if acquisition_types and len(acquisition_types) == 1 and acquisition_types[0].lower() == "all":
+        acquisition_types = None
+
+    # Validate orientation dropout settings
+    if args.drop_orientations is not None and len(args.drop_orientations) > 0:
+        if args.orientation_dropout_prob > 0.0:
+            print("WARNING: Both --drop_orientations and --orientation_dropout_prob specified. "
+                  "Using deterministic dropout (--drop_orientations) and ignoring probability.")
+        if len(args.drop_orientations) >= 3:
+            raise ValueError("Cannot drop all 3 orientations. At least one must remain.")
+
+    # Validate loss weights when orientation reconstruction is disabled
+    if args.no_reconstruct_orientations:
+        if args.orientation_weight > 0.0:
+            print("\n" + "="*80)
+            print("WARNING: Orientation reconstruction disabled but orientation_weight is non-zero")
+            print(f"  Current orientation_weight: {args.orientation_weight}")
+            print("  Orientation loss will be 0.0 regardless of this weight.")
+            print("  Recommendation: Set --orientation_weight 0.0 for cleaner metrics.")
+            print("="*80 + "\n")
+
+    # Get image paths
+    hr_image_paths = get_image_paths(
+        image_dir=args.hr_image_dir,
+        csv_file=args.csv_file,
+        base_dir=args.base_dir,
+        split="train",
+        model_dir=args.model_dir,
+        mri_classifications=args.mri_classes,
+        acquisition_types=acquisition_types,
+        filter_4d=not args.no_filter_4d,
+    )
+
+    val_image_paths = None
+    if args.val_image_dir or args.csv_file:
+        val_image_paths = get_image_paths(
+            image_dir=args.val_image_dir,
+            csv_file=args.csv_file,
+            base_dir=args.base_dir,
+            split="val",
+            model_dir=args.model_dir,
+            mri_classifications=args.mri_classes,
+            acquisition_types=acquisition_types,
+            filter_4d=not args.no_filter_4d,
+        )
+
+    # Create model directory
+    os.makedirs(args.model_dir, exist_ok=True)
+
+    # Save configuration
+    save_training_config(
+        model_dir=args.model_dir,
+        args=args,
+        n_train_samples=len(hr_image_paths),
+        n_val_samples=len(val_image_paths) if val_image_paths else 0,
+    )
+
+    # Prepare architecture-specific parameters
+    blocks_down = args.blocks_down if hasattr(args, 'blocks_down') else [1, 2, 2, 4]
+    blocks_up = args.blocks_up if hasattr(args, 'blocks_up') else [1, 1, 1]
+
+    # Train model
+    train_uhved_model(
+        hr_image_paths=hr_image_paths,
+        model_dir=args.model_dir,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        learning_rate=args.learning_rate,
+        output_shape=tuple(args.output_shape),
+        checkpoint=args.checkpoint,
+        device=args.device,
+        save_interval=args.save_interval,
+        val_interval=args.val_interval,
+        val_image_paths=val_image_paths,
+        atlas_res=args.atlas_res,
+        min_resolution=args.min_resolution,
+        max_res_aniso=args.max_res_aniso,
+        randomise_res=not args.no_randomise_res,
+        prob_motion=args.prob_motion,
+        prob_spike=args.prob_spike,
+        prob_aliasing=args.prob_aliasing,
+        prob_bias_field=args.prob_bias_field,
+        prob_noise=args.prob_noise,
+        fov_augmentation_prob=args.fov_augmentation_prob,
+        apply_intensity_aug=not args.no_intensity_aug,
+        orientation_dropout_prob=args.orientation_dropout_prob,
+        min_orientations=args.min_orientations,
+        drop_orientations=args.drop_orientations,
+        balanced_orientation_combos=args.balanced_orientation_combos,
+        num_workers=args.num_workers,
+        use_cache=args.use_cache,
+        use_wandb=args.use_wandb,
+        wandb_project=args.wandb_project,
+        wandb_entity=args.wandb_entity,
+        wandb_run_name=args.wandb_run_name,
+        num_scales=args.num_scales,
+        mixed_precision=args.mixed_precision,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        seed=args.seed,
+        recon_loss_type=args.recon_loss_type,
+        recon_weight=args.recon_weight,
+        kl_weight=args.kl_weight,
+        perceptual_weight=args.perceptual_weight,
+        ssim_weight=args.ssim_weight,
+        orientation_weight=args.orientation_weight,
+        use_perceptual=args.use_perceptual,
+        use_ssim=args.use_ssim,
+        perceptual_network=args.perceptual_network,
+        is_fake_3d=args.is_fake_3d,
+        reconstruct_orientations=not args.no_reconstruct_orientations,
+        max_grad_norm=args.max_grad_norm,
+        decoder_upsample_mode=args.decoder_upsample_mode,
+        upsample_mode=args.upsample_mode,
+        init_filters=args.init_filters,
+        blocks_down=blocks_down,
+        blocks_up=blocks_up,
+        num_groups=args.num_groups,
+        global_residual=not args.no_global_residual,
+        spectral_reg_weight=args.spectral_reg_weight,
+    )
