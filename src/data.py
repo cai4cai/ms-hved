@@ -1527,6 +1527,147 @@ class HRLRDataGenerator:
         else:
             return lr_stacks, hr_augmented, orientation_mask, spatial_masks, interp_masks
 
+    def generate_multi_variation_data(
+        self,
+        hr_images: torch.Tensor,
+        num_variations: int = 2,
+        return_resolution: bool = True,
+        sample_info: dict = None,
+        return_intermediate: bool = False,
+    ):
+        """
+        Generate multiple degradation variations from the same HR volume.
+
+        Normalizes HR once, then applies independent degradation pipelines
+        for each variation (different resolutions, artifacts, noise).
+
+        Args:
+            hr_images: High-resolution input images (B, C, D, H, W) in RAS orientation
+            num_variations: Number of degradation variations to generate
+            return_resolution: If True, also return resolution and thickness info
+            sample_info: Optional sample metadata
+            return_intermediate: If True, also return intermediate LR stacks
+
+        Returns:
+            Tuple of:
+                all_lr_stacks: List[List[Tensor]] — K variations, each with 3 LR stacks
+                hr_augmented: Tensor — shared HR target
+                all_resolutions: List[List[Tensor]] — K sets of resolutions
+                all_thicknesses: List[List[Tensor]] — K sets of thicknesses
+                all_orientation_masks: List[Tensor] — K orientation masks
+                all_spatial_masks: List[List[Tensor]] — K sets of spatial masks
+                all_interp_masks: List[List[Tensor]] — K sets of interp masks
+        """
+        batch_size = hr_images.shape[0]
+        device = hr_images.device
+
+        # === STEP 1: NORMALIZE HR ONCE (shared across all variations) ===
+        hr_augmented = self._normalize_image(hr_images)
+
+        hr_norm_stats = []
+        for b in range(batch_size):
+            hr_b = hr_augmented[b]
+            low = torch.quantile(hr_b, 0.005)
+            high = torch.quantile(hr_b, 0.995)
+            hr_norm_stats.append((low, high))
+
+        all_lr_stacks = []
+        all_resolutions = []
+        all_thicknesses = []
+        all_orientation_masks = []
+        all_spatial_masks = []
+        all_interp_masks = []
+
+        for _var_idx in range(num_variations):
+            # === STEP 2: FRESH RESOLUTION SAMPLING ===
+            resolutions, thicknesses = self._create_orthogonal_resolutions(batch_size, device)
+
+            # === STEP 3: FRESH ARTIFACT DECISIONS ===
+            apply_bias_field = torch.rand(batch_size, device=device) < self.prob_bias_field
+            apply_intensity_aug = self.apply_intensity_aug
+            apply_motion = torch.rand(batch_size, device=device) < self.artifact_simulator.prob_motion
+            apply_spike = torch.rand(batch_size, device=device) < self.artifact_simulator.prob_spike
+            apply_aliasing = torch.rand(batch_size, device=device) < self.artifact_simulator.prob_aliasing
+            apply_noise = torch.rand(batch_size, device=device) < self.artifact_simulator.prob_noise
+            motion_axis = torch.randint(0, 3, (batch_size,), device=device)
+            aliasing_axis = torch.randint(0, 3, (batch_size,), device=device)
+
+            # === STEP 4: FRESH DEGRADATION ===
+            hr_degraded = hr_augmented.clone()
+            for b in range(batch_size):
+                if apply_bias_field[b]:
+                    hr_degraded[b:b+1] = self.bias(hr_degraded[b:b+1])
+
+            if apply_intensity_aug:
+                for b in range(batch_size):
+                    hr_degraded[b:b+1] = self.intensity_aug(hr_degraded[b:b+1])
+
+            lr_stacks = []
+            interp_masks = []
+
+            for stack_idx in range(3):
+                lr_images = hr_degraded.clone()
+                resolution = resolutions[stack_idx]
+                thickness = thicknesses[stack_idx]
+
+                result = self.artifact_simulator(
+                    lr_images,
+                    resolution,
+                    thickness,
+                    enable_motion=apply_motion,
+                    enable_spike=apply_spike,
+                    enable_aliasing=apply_aliasing,
+                    enable_noise=apply_noise,
+                    motion_axis=motion_axis,
+                    aliasing_axis=aliasing_axis,
+                    return_intermediate=False,
+                )
+                lr_images, stack_interp_masks = result
+                interp_masks.append(stack_interp_masks)
+
+                if self.clip_to_unit_range:
+                    lr_norm = []
+                    for b in range(batch_size):
+                        lr_b = lr_images[b:b+1]
+                        low, high = hr_norm_stats[b]
+                        lr_b = torch.clamp(lr_b, low, high)
+                        lr_b = (lr_b - low) / (high - low + 1e-8)
+                        lr_norm.append(lr_b)
+                    lr_images = torch.cat(lr_norm, dim=0)
+
+                lr_stacks.append(lr_images)
+
+            # === STEP 5: ORIENTATION MASK ===
+            orientation_mask = self._create_orientation_mask(batch_size, device)
+
+            # === STEP 6: FOV AUGMENTATION ===
+            if self.fov_augmentation_prob > 0:
+                lr_stacks, spatial_masks = self.fov_augmenter(lr_stacks)
+            else:
+                spatial_masks = [
+                    torch.ones(batch_size, 1, *lr_stacks[0].shape[-3:], device=device)
+                    for _ in range(3)
+                ]
+
+            all_lr_stacks.append(lr_stacks)
+            all_resolutions.append(resolutions)
+            all_thicknesses.append(thicknesses)
+            all_orientation_masks.append(orientation_mask)
+            all_spatial_masks.append(spatial_masks)
+            all_interp_masks.append(interp_masks)
+
+        # HR is already normalized; clip tiny float drift
+        hr_augmented = torch.clamp(hr_augmented, 0.0, 1.0)
+
+        return (
+            all_lr_stacks,
+            hr_augmented,
+            all_resolutions,
+            all_thicknesses,
+            all_orientation_masks,
+            all_spatial_masks,
+            all_interp_masks,
+        )
 
 
 # --- Dataset Wrappers ---
@@ -1546,11 +1687,13 @@ class GeneratorDataset(torch.utils.data.Dataset):
         generator,
         return_resolution,
         balanced_orientation_combos: bool = False,
+        num_variations: int = 1,
     ):
         self.base_dataset = base_dataset
         self.generator = generator
         self.return_resolution = return_resolution
         self.balanced_orientation_combos = balanced_orientation_combos
+        self.num_variations = num_variations
         self._orientation_combo_schedule = None
         self._epoch = 0
         self._last_built_epoch = None
@@ -1615,6 +1758,44 @@ class GeneratorDataset(torch.utils.data.Dataset):
             hr_image = hr_image.unsqueeze(0)
         hr_image = hr_image.unsqueeze(0)  # (1, C, D, H, W)
 
+        # Multi-variation mode: generate K degradation variations from the same HR
+        if self.num_variations > 1:
+            result = self.generator.generate_multi_variation_data(
+                hr_image,
+                num_variations=self.num_variations,
+                return_resolution=True,
+                sample_info=sample_info,
+            )
+            (all_lr_stacks, hr_augmented, all_resolutions, all_thicknesses,
+             all_orientation_masks, all_spatial_masks, all_interp_masks) = result
+
+            # Build per-variation tuples, each matching the single-variation format
+            variations = []
+            for v in range(self.num_variations):
+                lr_stacks = all_lr_stacks[v]
+                resolutions = all_resolutions[v]
+                thicknesses = all_thicknesses[v]
+                orientation_mask = all_orientation_masks[v]
+                spatial_masks = all_spatial_masks[v]
+                interp_masks = all_interp_masks[v]
+
+                if self.balanced_orientation_combos:
+                    orientation_mask = self._orientation_combo_schedule[idx]
+
+                variations.append((
+                    [stack.squeeze(0) for stack in lr_stacks],
+                    [res.squeeze(0) for res in resolutions],
+                    [thick.squeeze(0) for thick in thicknesses],
+                    orientation_mask.squeeze(0),
+                    [mask.squeeze(0) for mask in spatial_masks],
+                    [mask.squeeze(0) for mask in interp_masks],
+                ))
+
+            # Return: (variations_list, hr_target)
+            # Each variation: (lr_stacks, resolutions, thicknesses, orientation_mask, spatial_masks, interp_masks)
+            return (variations, hr_augmented.squeeze(0))
+
+        # Single-variation mode (backward compatible)
         result = self.generator.generate_paired_data(
             hr_image,
             return_resolution=self.return_resolution,
@@ -1625,29 +1806,62 @@ class GeneratorDataset(torch.utils.data.Dataset):
             lr_stacks, hr_augmented, resolutions, thicknesses, orientation_mask, spatial_masks, interp_masks = result
             if self.balanced_orientation_combos:
                 orientation_mask = self._orientation_combo_schedule[idx]
-            # lr_stacks is a list of 3 tensors, each (1, C, D, H, W)
-            # Return them as separate orientations
             return (
-                [stack.squeeze(0) for stack in lr_stacks],  # List of 3 orientations
-                hr_augmented.squeeze(0),  # HR ground truth
-                [res.squeeze(0) for res in resolutions],  # List of 3 resolution configs
-                [thick.squeeze(0) for thick in thicknesses],  # List of 3 thickness configs
-                orientation_mask.squeeze(0),  # Orientation mask (3,)
-                [mask.squeeze(0) for mask in spatial_masks],  # List of 3 spatial masks
-                [mask.squeeze(0) for mask in interp_masks]  # List of 3 interpolation masks
+                [stack.squeeze(0) for stack in lr_stacks],
+                hr_augmented.squeeze(0),
+                [res.squeeze(0) for res in resolutions],
+                [thick.squeeze(0) for thick in thicknesses],
+                orientation_mask.squeeze(0),
+                [mask.squeeze(0) for mask in spatial_masks],
+                [mask.squeeze(0) for mask in interp_masks]
             )
         else:
             lr_stacks, hr_augmented, orientation_mask, spatial_masks, interp_masks = result
             if self.balanced_orientation_combos:
                 orientation_mask = self._orientation_combo_schedule[idx]
-            # Return the three LR stacks as a list
             return (
                 [stack.squeeze(0) for stack in lr_stacks],
                 hr_augmented.squeeze(0),
                 orientation_mask.squeeze(0),
-                [mask.squeeze(0) for mask in spatial_masks],  # List of 3 spatial masks
-                [mask.squeeze(0) for mask in interp_masks]  # List of 3 interpolation masks
+                [mask.squeeze(0) for mask in spatial_masks],
+                [mask.squeeze(0) for mask in interp_masks]
             )
+
+
+def multi_variation_collate_fn(batch):
+    """
+    Custom collate for multi-variation data.
+
+    Each sample is (variations_list, hr_target) where variations_list contains
+    K tuples of (lr_stacks, resolutions, thicknesses, orientation_mask, spatial_masks, interp_masks).
+
+    Returns:
+        variations_data: List[K] of (lr_stacks, resolutions, thicknesses, orientation_mask, spatial_masks, interp_masks)
+            where each tensor is batched along dim 0
+        hr_target: (B, C, D, H, W)
+    """
+    variations_lists, hr_targets = zip(*batch)
+    hr_target = torch.stack(hr_targets, dim=0)
+
+    num_variations = len(variations_lists[0])
+    batched_variations = []
+
+    for v in range(num_variations):
+        # Collect variation v from all samples in the batch
+        var_data = [sample[v] for sample in variations_lists]
+        # var_data[i] = (lr_stacks, resolutions, thicknesses, orientation_mask, spatial_masks, interp_masks)
+
+        # Stack lr_stacks: list of 3, each becomes (B, C, D, H, W)
+        lr_stacks = [torch.stack([s[0][orient] for s in var_data], dim=0) for orient in range(3)]
+        resolutions = [torch.stack([s[1][orient] for s in var_data], dim=0) for orient in range(3)]
+        thicknesses = [torch.stack([s[2][orient] for s in var_data], dim=0) for orient in range(3)]
+        orientation_mask = torch.stack([s[3] for s in var_data], dim=0)
+        spatial_masks = [torch.stack([s[4][orient] for s in var_data], dim=0) for orient in range(3)]
+        interp_masks = [torch.stack([s[5][orient] for s in var_data], dim=0) for orient in range(3)]
+
+        batched_variations.append((lr_stacks, resolutions, thicknesses, orientation_mask, spatial_masks, interp_masks))
+
+    return batched_variations, hr_target
 
 
 def create_dataset(
@@ -1659,6 +1873,7 @@ def create_dataset(
     return_resolution: bool = False,
     is_training: bool = True,
     balanced_orientation_combos: bool = False,
+    num_variations: int = 1,
 ):
     """
     Creates the training dataset using HRLRDataGenerator.
@@ -1709,4 +1924,5 @@ def create_dataset(
         generator,
         return_resolution,
         balanced_orientation_combos=balanced_orientation_combos,
+        num_variations=num_variations,
     )

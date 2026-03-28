@@ -80,7 +80,8 @@ class KLDivergence(nn.Module):
     def multi_scale(
         self,
         posteriors: List[Tuple[torch.Tensor, torch.Tensor]],
-        weights: Optional[List[float]] = None
+        weights: Optional[List[float]] = None,
+        use_volume_heuristic: bool = True
     ) -> torch.Tensor:
         """
         Compute weighted sum of KL divergence across scales.
@@ -88,12 +89,25 @@ class KLDivergence(nn.Module):
         Args:
             posteriors: List of (mu, logvar) tuples at each scale
             weights: Optional weights for each scale (default: equal weighting)
+            use_volume_heuristic: If True, dynamically scales down the weight 
+                                  for deeper layers based on their spatial volume.
+                                  This prevents KL from dominating at coarse resolutions.
 
         Returns:
             Total KL loss
         """
         if weights is None:
             weights = [1.0] * len(posteriors)
+        
+        if use_volume_heuristic:
+            # Calculate spatial volume (D * H * W) for each scale
+            # p[0] is mu, shape: (B, C, D, H, W) -> spatial dims are 2, 3, 4
+            volumes = [float(p[0].shape[2] * p[0].shape[3] * p[0].shape[4]) for p in posteriors]
+            
+            # Normalize so the largest spatial map gets weight=1.0
+            # Smaller volumes (coarser resolutions) get proportionally smaller weights
+            max_vol = max(volumes)
+            weights = [w * (v / max_vol) for w, v in zip(weights, volumes)]
 
         total_kl = 0.0
         for (mu, logvar), w in zip(posteriors, weights):
@@ -202,6 +216,81 @@ class SSIM3DLoss(nn.Module):
         return self.ssim_loss(pred, target)
 
 
+class OutputConsistencyLoss(nn.Module):
+    """
+    Penalizes differences between SR outputs from different degradation
+    variations of the same HR volume.
+
+    For K variations: L = (2 / K(K-1)) * sum_{i<j} ||SR_i - SR_j||_1
+    For K=2: L = ||SR_1 - SR_2||_1
+    """
+
+    def __init__(self, loss_type: str = 'l1'):
+        super().__init__()
+        self.loss_fn = F.l1_loss if loss_type == 'l1' else F.mse_loss
+
+    def forward(self, sr_outputs: List[torch.Tensor]) -> torch.Tensor:
+        """
+        Args:
+            sr_outputs: List of K SR outputs, each (B, C, D, H, W)
+        """
+        loss = torch.tensor(0.0, device=sr_outputs[0].device)
+        count = 0
+        for i in range(len(sr_outputs)):
+            for j in range(i + 1, len(sr_outputs)):
+                loss = loss + self.loss_fn(sr_outputs[i], sr_outputs[j])
+                count += 1
+        return loss / max(count, 1)
+
+
+class LatentConsistencyLoss(nn.Module):
+    """
+    Penalizes divergence between PoG posteriors from different degradation
+    variations of the same HR volume using symmetric KL divergence.
+
+    D_SKL(q1 || q2) = 0.5 * [KL(q1||q2) + KL(q2||q1)]
+
+    For diagonal Gaussians:
+    KL(q1||q2) = 0.5 * [logvar2 - logvar1 + (var1 + (mu1-mu2)^2) / var2 - 1]
+    """
+
+    def __init__(self, reduction: str = 'mean'):
+        super().__init__()
+        self.reduction = reduction
+
+    def forward(
+        self,
+        posteriors_1: List[Tuple[torch.Tensor, torch.Tensor]],
+        posteriors_2: List[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> torch.Tensor:
+        """
+        Args:
+            posteriors_1: List of (mu, logvar) at each scale from variation 1
+            posteriors_2: List of (mu, logvar) at each scale from variation 2
+        """
+        total = torch.tensor(0.0, device=posteriors_1[0][0].device)
+        for (mu1, lv1), (mu2, lv2) in zip(posteriors_1, posteriors_2):
+            mu1, lv1 = mu1.float(), lv1.float()
+            mu2, lv2 = mu2.float(), lv2.float()
+
+            lv1 = torch.clamp(lv1, -10.0, 10.0)
+            lv2 = torch.clamp(lv2, -10.0, 10.0)
+            var1 = lv1.exp()
+            var2 = lv2.exp()
+
+            kl_12 = 0.5 * (lv2 - lv1 + (var1 + (mu1 - mu2) ** 2) / (var2 + 1e-7) - 1)
+            kl_21 = 0.5 * (lv1 - lv2 + (var2 + (mu1 - mu2) ** 2) / (var1 + 1e-7) - 1)
+
+            sym_kl = 0.5 * (kl_12 + kl_21)
+
+            if self.reduction == 'mean':
+                total = total + sym_kl.mean()
+            else:
+                total = total + sym_kl.sum()
+
+        return total / max(len(posteriors_1), 1)
+
+
 class MSHVEDLoss(nn.Module):
     """
     Combined 3D loss function for MS-HVED Super-Resolution on volumetric data.
@@ -233,7 +322,11 @@ class MSHVEDLoss(nn.Module):
         is_fake_3d: bool = False,
         kl_annealing: bool = True,
         kl_anneal_steps: int = 10000,
-        free_bits: float = 1.0,
+        free_bits: float = 0.0,
+        consistency_weight: float = 0.0,
+        latent_consistency_weight: float = 0.0,
+        consistency_warmup_steps: int = 5000,
+        use_volume_heuristic: bool = True,
     ):
         """
         Args:
@@ -257,6 +350,13 @@ class MSHVEDLoss(nn.Module):
                 - True: 2.5D slice-based processing (faster, lower memory)
             kl_annealing: Whether to anneal KL weight
             kl_anneal_steps: Number of steps for KL annealing
+            free_bits: Minimum free nats per latent dimension before contributing to loss
+            consistency_weight: Weight for output consistency loss
+            latent_consistency_weight: Weight for latent consistency loss
+            consistency_warmup_steps: Number of steps to warmup consistency losses
+            use_volume_heuristic: If True, scales KL weight by spatial volume at each resolution.
+                This prevents KL from dominating at coarse (low-res) latent scales.
+                Recommended: True for multi-scale VAEs with varying spatial resolutions.
         """
         super().__init__()
 
@@ -267,6 +367,10 @@ class MSHVEDLoss(nn.Module):
         self.orientation_weight = orientation_weight
         self.kl_annealing = kl_annealing
         self.kl_anneal_steps = kl_anneal_steps
+        self.consistency_weight = consistency_weight
+        self.latent_consistency_weight = latent_consistency_weight
+        self.consistency_warmup_steps = consistency_warmup_steps
+        self.use_volume_heuristic = use_volume_heuristic
 
         # Reconstruction loss (works with any dimension)
         self.recon_loss = ReconstructionLoss(loss_type=recon_loss_type)
@@ -316,7 +420,11 @@ class MSHVEDLoss(nn.Module):
         else:
             self.ssim_loss = None
 
-        # Current step for KL annealing
+        # Consistency losses
+        self.output_consistency_loss = OutputConsistencyLoss(loss_type='l1')
+        self.latent_consistency_loss = LatentConsistencyLoss()
+
+        # Current step for KL annealing and consistency warmup
         self.register_buffer('current_step', torch.tensor(0))
 
     def get_kl_weight(self) -> float:
@@ -327,6 +435,20 @@ class MSHVEDLoss(nn.Module):
         # Linear annealing from 0 to kl_weight
         progress = min(self.current_step.item() / self.kl_anneal_steps, 1.0)
         return self.kl_weight * progress
+
+    def get_consistency_weight(self) -> float:
+        """Get current consistency weight with linear warmup."""
+        if self.consistency_warmup_steps <= 0:
+            return self.consistency_weight
+        progress = min(self.current_step.item() / self.consistency_warmup_steps, 1.0)
+        return self.consistency_weight * progress
+
+    def get_latent_consistency_weight(self) -> float:
+        """Get current latent consistency weight with linear warmup."""
+        if self.consistency_warmup_steps <= 0:
+            return self.latent_consistency_weight
+        progress = min(self.current_step.item() / self.consistency_warmup_steps, 1.0)
+        return self.latent_consistency_weight * progress
 
     def _maybe_move_perceptual(self, device: torch.device) -> None:
         if not isinstance(self.perceptual_loss, nn.Module):
@@ -345,6 +467,8 @@ class MSHVEDLoss(nn.Module):
         posteriors: List[Tuple[torch.Tensor, torch.Tensor]],
         orientation_outputs: Optional[List[torch.Tensor]] = None,
         orientation_targets: Optional[List[torch.Tensor]] = None,
+        sr_outputs_other: Optional[List[torch.Tensor]] = None,
+        posteriors_other: Optional[List[List[Tuple[torch.Tensor, torch.Tensor]]]] = None,
         return_components: bool = False
     ) -> torch.Tensor | Dict[str, torch.Tensor]:
         """
@@ -356,6 +480,8 @@ class MSHVEDLoss(nn.Module):
             posteriors: List of (mu, logvar) from encoder
             orientation_outputs: Reconstructed orientations (optional)
             orientation_targets: Target orientations (optional)
+            sr_outputs_other: SR outputs from other degradation variations (optional)
+            posteriors_other: Posteriors from other degradation variations (optional)
             return_components: If True, return dict of individual losses
 
         Returns:
@@ -366,9 +492,12 @@ class MSHVEDLoss(nn.Module):
         # Main reconstruction loss (L1/L2/Charbonnier)
         losses['reconstruction'] = self.recon_loss(sr_output, sr_target) * self.recon_weight
 
-        # KL divergence (multi-scale)
+        # KL divergence (multi-scale with optional volume heuristic)
         kl_weight = self.get_kl_weight()
-        losses['kl'] = self.kl_loss.multi_scale(posteriors) * kl_weight
+        losses['kl'] = self.kl_loss.multi_scale(
+            posteriors, 
+            use_volume_heuristic=self.use_volume_heuristic
+        ) * kl_weight
 
         # 3D Perceptual loss
         if self.perceptual_loss is not None:
@@ -401,6 +530,24 @@ class MSHVEDLoss(nn.Module):
         else:
             losses['orientation'] = torch.tensor(0.0, device=sr_output.device)
 
+        # Output consistency loss (across degradation variations)
+        if sr_outputs_other is not None and len(sr_outputs_other) > 0:
+            all_sr = [sr_output] + sr_outputs_other
+            cw = self.get_consistency_weight()
+            losses['output_consistency'] = self.output_consistency_loss(all_sr) * cw
+        else:
+            losses['output_consistency'] = torch.tensor(0.0, device=sr_output.device)
+
+        # Latent consistency loss (across degradation variations)
+        if posteriors_other is not None and len(posteriors_other) > 0:
+            lcw = self.get_latent_consistency_weight()
+            latent_loss = torch.tensor(0.0, device=sr_output.device)
+            for other_post in posteriors_other:
+                latent_loss = latent_loss + self.latent_consistency_loss(posteriors, other_post)
+            losses['latent_consistency'] = (latent_loss / len(posteriors_other)) * lcw
+        else:
+            losses['latent_consistency'] = torch.tensor(0.0, device=sr_output.device)
+
         # Total loss
         total_loss = sum(losses.values())
 
@@ -413,44 +560,6 @@ class MSHVEDLoss(nn.Module):
             return losses
 
         return total_loss
-
-
-def spectral_regularization(model: nn.Module) -> torch.Tensor:
-    """
-    Compute spectral regularization loss (NVAE, Vahdat & Kautz 2020).
-
-    Sums the largest singular value of each Conv3d/ConvTranspose3d weight matrix
-    in the model. Constrains the Lipschitz constant of the network, keeping
-    encoder outputs (mu, logvar) bounded — critical for stable KL in
-    normalization-free architectures.
-
-    L_SR = Σᵢ s⁽ⁱ⁾
-
-    where s⁽ⁱ⁾ is the largest singular value of the i-th conv layer,
-    estimated via a single power iteration step.
-
-    Returns:
-        Scalar spectral regularization loss (unweighted — caller applies λ).
-    """
-    total = torch.tensor(0.0, device=next(model.parameters()).device)
-    for module in model.modules():
-        if isinstance(module, (nn.Conv3d, nn.ConvTranspose3d)):
-            w = module.weight
-            # Reshape to 2D: (out_features, in_features * kernel)
-            w_mat = w.reshape(w.shape[0], -1)
-            # Single power iteration to estimate largest singular value
-            # Use detached random vector for stability (no grad through SVD estimate)
-            if not hasattr(module, '_sr_u'):
-                module._sr_u = F.normalize(torch.randn(w_mat.shape[0], device=w.device), dim=0)
-            u = module._sr_u
-            with torch.no_grad():
-                v = F.normalize(w_mat.t() @ u, dim=0)
-                u = F.normalize(w_mat @ v, dim=0)
-                module._sr_u = u
-            # Compute sigma with grad (through w_mat, not u/v)
-            sigma = u @ w_mat @ v
-            total = total + sigma
-    return total
 
 
 # Convenience function to create 3D loss

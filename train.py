@@ -33,7 +33,6 @@ from monai.data import DataLoader
 
 # Import our modules
 from src import MSHVEDLoss, create_mshved
-from src.losses import spectral_regularization
 from src.data import HRLRDataGenerator, create_dataset
 from src.utils import (
     save_model_checkpoint,
@@ -132,7 +131,10 @@ def train_uhved_model(
     blocks_up: list = None,
     num_groups: int = 8,
     global_residual: bool = True,
-    spectral_reg_weight: float = 0.0,
+    num_variations: int = 1,
+    consistency_weight: float = 0.2,
+    latent_consistency_weight: float = 0.05,
+    consistency_warmup_steps: int = 5000,
 ):
     """
     Train MS-HVED model with orthogonal LR stacks
@@ -275,17 +277,21 @@ def train_uhved_model(
         return_resolution=True,
         is_training=True,
         balanced_orientation_combos=balanced_orientation_combos,
+        num_variations=num_variations,
     )
 
     # Create DataLoader
-    dataloader = DataLoader(
-        dataset,
+    from src.data import multi_variation_collate_fn
+    dataloader_kwargs = dict(
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=(num_workers > 0),
     )
+    if num_variations > 1:
+        dataloader_kwargs['collate_fn'] = multi_variation_collate_fn
+    dataloader = DataLoader(dataset, **dataloader_kwargs)
 
     if accelerator.is_main_process:
         print(f"Training dataset: {len(dataset)} images")
@@ -388,11 +394,16 @@ def train_uhved_model(
         use_ssim=use_ssim,
         perceptual_network=perceptual_network,
         is_fake_3d=is_fake_3d,
+        consistency_weight=consistency_weight if num_variations > 1 else 0.0,
+        latent_consistency_weight=latent_consistency_weight if num_variations > 1 else 0.0,
+        consistency_warmup_steps=consistency_warmup_steps,
     )
 
     if accelerator.is_main_process:
-        sr_str = f", spectral_reg={spectral_reg_weight}" if spectral_reg_weight > 0 else ""
-        print(f"Loss weights: recon={recon_weight}, kl={kl_weight}, perceptual={perceptual_weight}, orientation={orientation_weight}{sr_str}")
+        cons_str = f", consistency={consistency_weight}, latent_consistency={latent_consistency_weight}" if num_variations > 1 else ""
+        print(f"Loss weights: recon={recon_weight}, kl={kl_weight}, perceptual={perceptual_weight}, orientation={orientation_weight}{cons_str}")
+        if num_variations > 1:
+            print(f"Multi-variation consistency training: {num_variations} variations per sample, warmup={consistency_warmup_steps} steps")
 
     # Calculate total training steps for scheduler
     num_steps = len(dataloader) * epochs
@@ -455,6 +466,10 @@ def train_uhved_model(
             "blocks_down": blocks_down,
             "blocks_up": blocks_up,
             "num_groups": num_groups,
+            "num_variations": num_variations,
+            "consistency_weight": consistency_weight if num_variations > 1 else 0.0,
+            "latent_consistency_weight": latent_consistency_weight if num_variations > 1 else 0.0,
+            "consistency_warmup_steps": consistency_warmup_steps,
         }
 
         wandb.init(
@@ -476,6 +491,7 @@ def train_uhved_model(
         csv_path = os.path.join(model_dir, csv_filename)
 
         csv_headers = ["epoch", "train_loss", "train_recon", "train_kl", "train_ssim", "train_perceptual", "train_orientation",
+                        "train_output_consistency", "train_latent_consistency",
                         "learning_rate", "epoch_time"]
         if val_dataloader:
             csv_headers.extend([
@@ -501,7 +517,8 @@ def train_uhved_model(
         epoch_ssim_loss = 0.0
         epoch_perceptual_loss = 0.0
         epoch_orientation_loss = 0.0
-        epoch_spectral_loss = 0.0
+        epoch_output_consistency_loss = 0.0
+        epoch_latent_consistency_loss = 0.0
 
         pbar = tqdm(
             dataloader,
@@ -512,60 +529,111 @@ def train_uhved_model(
         )
 
         for batch_idx, batch_data in enumerate(pbar):
-            # Unpack batch: (lr_stacks_list, hr, resolutions_list, thicknesses_list, orientation_mask, spatial_masks, interp_masks)
-            lr_stacks_list, target_img, resolutions_list, thicknesses_list, orientation_mask, spatial_masks, interp_masks = batch_data
-            orientations = lr_stacks_list
+            # Unpack batch depending on mode
+            if num_variations > 1:
+                # Multi-variation mode: batch_data = (variations_data, hr_target)
+                variations_data, target_img = batch_data
+                target_img = target_img.float()
 
-            # Ensure consistent dtype
-            orientations = [m.float() for m in orientations]
-            target_img = target_img.float()
+                # Variation 1 (with gradients): use variation index based on batch_idx parity
+                # to symmetrize gradient signal across variations
+                v1_idx = batch_idx % num_variations
+                v2_idx = (batch_idx + 1) % num_variations
 
-            # Forward and backward pass
-            with accelerator.accumulate(model):
-                outputs = model(orientations, orientation_mask=orientation_mask, interp_masks=interp_masks)
+                v1_lr, v1_res, v1_thick, v1_mask, v1_spatial, v1_interp = variations_data[v1_idx]
+                v1_orientations = [m.float() for m in v1_lr]
 
-                # Compute loss
-                losses = criterion(
-                    sr_output=outputs['sr_output'],
-                    sr_target=target_img,
-                    posteriors=outputs['posteriors'],
-                    orientation_outputs=outputs.get('orientation_outputs'),
-                    orientation_targets=orientations,
-                    return_components=True
-                )
+                with accelerator.accumulate(model):
+                    # Forward variation 1 (with gradients)
+                    outputs_v1 = model(v1_orientations, orientation_mask=v1_mask, interp_masks=v1_interp)
 
-                loss = losses['total']
+                    # Forward variation 2 (detached — saves memory)
+                    v2_lr, v2_res, v2_thick, v2_mask, v2_spatial, v2_interp = variations_data[v2_idx]
+                    v2_orientations = [m.float() for m in v2_lr]
+                    with torch.no_grad():
+                        outputs_v2 = model(v2_orientations, orientation_mask=v2_mask, interp_masks=v2_interp)
 
-                # Spectral regularization: bound encoder Lipschitz constant (NVAE)
-                if spectral_reg_weight > 0:
-                    sr_loss = spectral_regularization(model)
-                    losses['spectral_reg'] = sr_loss * spectral_reg_weight
-                    loss = loss + losses['spectral_reg']
-                    losses['total'] = loss
+                    # Detach posteriors from variation 2
+                    posteriors_v2_detached = [
+                        (mu.detach(), lv.detach()) for mu, lv in outputs_v2['posteriors']
+                    ]
 
-                # NaN/Inf detection: skip corrupted batches
-                if torch.isnan(loss) or torch.isinf(loss):
-                    if accelerator.is_main_process:
-                        components = {k: v.item() if torch.is_tensor(v) else v for k, v in losses.items()}
-                        print(f"WARNING: NaN/Inf loss at batch {batch_idx}. Components: {components}. Skipping batch.")
+                    # Compute loss: standard losses on v1 + consistency between v1 and v2
+                    losses = criterion(
+                        sr_output=outputs_v1['sr_output'],
+                        sr_target=target_img,
+                        posteriors=outputs_v1['posteriors'],
+                        orientation_outputs=outputs_v1.get('orientation_outputs'),
+                        orientation_targets=v1_orientations,
+                        sr_outputs_other=[outputs_v2['sr_output'].detach()],
+                        posteriors_other=[posteriors_v2_detached],
+                        return_components=True
+                    )
+
+                    loss = losses['total']
+
+
+                    # NaN/Inf detection
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        if accelerator.is_main_process:
+                            components = {k: v.item() if torch.is_tensor(v) else v for k, v in losses.items()}
+                            print(f"WARNING: NaN/Inf loss at batch {batch_idx}. Components: {components}. Skipping batch.")
+                        optimizer.zero_grad()
+                        continue
+
+                    # Backward pass
                     optimizer.zero_grad()
-                    continue
+                    accelerator.backward(loss)
 
-                # Backward pass
-                optimizer.zero_grad()
-                accelerator.backward(loss)
+                    if max_grad_norm > 0:
+                        if accelerator.sync_gradients:
+                            accelerator.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+                        else:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
 
-                # Gradient clipping (works with both Accelerate and single GPU)
-                if max_grad_norm > 0:
-                    if accelerator.sync_gradients:
-                        # Multi-GPU: Use Accelerate's method
-                        accelerator.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
-                    else:
-                        # Single GPU or no sync needed: Use PyTorch's method
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+                    optimizer.step()
+                    scheduler.step()
 
-                optimizer.step()
-                scheduler.step()
+            else:
+                # Single-variation mode (original behavior)
+                lr_stacks_list, target_img, resolutions_list, thicknesses_list, orientation_mask, spatial_masks, interp_masks = batch_data
+                orientations = lr_stacks_list
+
+                orientations = [m.float() for m in orientations]
+                target_img = target_img.float()
+
+                with accelerator.accumulate(model):
+                    outputs = model(orientations, orientation_mask=orientation_mask, interp_masks=interp_masks)
+
+                    losses = criterion(
+                        sr_output=outputs['sr_output'],
+                        sr_target=target_img,
+                        posteriors=outputs['posteriors'],
+                        orientation_outputs=outputs.get('orientation_outputs'),
+                        orientation_targets=orientations,
+                        return_components=True
+                    )
+
+                    loss = losses['total']
+
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        if accelerator.is_main_process:
+                            components = {k: v.item() if torch.is_tensor(v) else v for k, v in losses.items()}
+                            print(f"WARNING: NaN/Inf loss at batch {batch_idx}. Components: {components}. Skipping batch.")
+                        optimizer.zero_grad()
+                        continue
+
+                    optimizer.zero_grad()
+                    accelerator.backward(loss)
+
+                    if max_grad_norm > 0:
+                        if accelerator.sync_gradients:
+                            accelerator.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+                        else:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+
+                    optimizer.step()
+                    scheduler.step()
 
             epoch_loss += loss.item()
 
@@ -574,7 +642,8 @@ def train_uhved_model(
             epoch_ssim_loss += losses['ssim'].item() if 'ssim' in losses else 0.0
             epoch_perceptual_loss += losses['perceptual'].item() if 'perceptual' in losses else 0.0
             epoch_orientation_loss += losses['orientation'].item() if 'orientation' in losses else 0.0
-            epoch_spectral_loss += losses['spectral_reg'].item() if 'spectral_reg' in losses else 0.0
+            epoch_output_consistency_loss += losses.get('output_consistency', torch.tensor(0.0)).item()
+            epoch_latent_consistency_loss += losses.get('latent_consistency', torch.tensor(0.0)).item()
 
             # Update progress bar with loss and memory
             current_lr = optimizer.param_groups[0]['lr']
@@ -587,6 +656,9 @@ def train_uhved_model(
                 "orientation": f"{losses['orientation'].item():.4f}" if 'orientation' in losses else "N/A",
                 "lr": f"{current_lr:.2e}"
             }
+            if num_variations > 1:
+                postfix_dict["o_cons"] = f"{losses.get('output_consistency', torch.tensor(0.0)).item():.4f}"
+                postfix_dict["l_cons"] = f"{losses.get('latent_consistency', torch.tensor(0.0)).item():.4f}"
 
             pbar.set_postfix(postfix_dict)
 
@@ -597,6 +669,8 @@ def train_uhved_model(
         avg_ssim = epoch_ssim_loss / len(dataloader) if epoch_ssim_loss > 0 else 0.0
         avg_perceptual = epoch_perceptual_loss / len(dataloader) if epoch_perceptual_loss > 0 else 0.0
         avg_orientation = epoch_orientation_loss / len(dataloader) if epoch_orientation_loss > 0 else 0.0
+        avg_output_consistency = epoch_output_consistency_loss / len(dataloader) if epoch_output_consistency_loss > 0 else 0.0
+        avg_latent_consistency = epoch_latent_consistency_loss / len(dataloader) if epoch_latent_consistency_loss > 0 else 0.0
 
         # Validation
         val_loss = None
@@ -659,9 +733,10 @@ def train_uhved_model(
 
             epoch_time = time.time() - epoch_start_time
             # Print validation results 
+            cons_str = f", OutCons: {avg_output_consistency:.4f}, LatCons: {avg_latent_consistency:.4f}" if num_variations > 1 else ""
             accelerator.print(
                 f"Epoch {epoch + 1}/{epochs} - Train Loss: {avg_loss:.4f} "
-                f"(Recon: {avg_recon:.4f}, KL: {avg_kl:.6f}, SSIM: {avg_ssim:.4f}, Percep: {avg_perceptual:.4f}, Orient: {avg_orientation:.4f})"
+                f"(Recon: {avg_recon:.4f}, KL: {avg_kl:.6f}, SSIM: {avg_ssim:.4f}, Percep: {avg_perceptual:.4f}, Orient: {avg_orientation:.4f}{cons_str})"
             )
             accelerator.print(
                 f"  Val Loss: {val_loss:.4f} "
@@ -677,9 +752,10 @@ def train_uhved_model(
         else:
             epoch_time = time.time() - epoch_start_time
             # Print training summary 
+            cons_str = f", OutCons: {avg_output_consistency:.4f}, LatCons: {avg_latent_consistency:.4f}" if num_variations > 1 else ""
             accelerator.print(
                 f"Epoch {epoch + 1}/{epochs} - Loss: {avg_loss:.4f} "
-                f"(Recon: {avg_recon:.4f}, KL: {avg_kl:.6f}, SSIM: {avg_ssim:.4f}, Percep: {avg_perceptual:.4f}, orientation: {avg_orientation:.4f}) - LR: {current_lr:.2e}"
+                f"(Recon: {avg_recon:.4f}, KL: {avg_kl:.6f}, SSIM: {avg_ssim:.4f}, Percep: {avg_perceptual:.4f}, orientation: {avg_orientation:.4f}{cons_str}) - LR: {current_lr:.2e}"
             )
 
         # Log to CSV
@@ -692,6 +768,8 @@ def train_uhved_model(
                 "train_ssim": avg_ssim,
                 "train_perceptual": avg_perceptual,
                 "train_orientation": avg_orientation,
+                "train_output_consistency": avg_output_consistency,
+                "train_latent_consistency": avg_latent_consistency,
                 "learning_rate": current_lr,
                 "epoch_time": epoch_time,
             }
@@ -724,6 +802,8 @@ def train_uhved_model(
                 "train/ssim": avg_ssim,
                 "train/perceptual": avg_perceptual,
                 "train/orientation": avg_orientation,
+                "train/output_consistency": avg_output_consistency,
+                "train/latent_consistency": avg_latent_consistency,
                 "train/learning_rate": current_lr,
             }
             if val_loss is not None and val_metrics is not None:
@@ -975,10 +1055,17 @@ if __name__ == "__main__":
                              "medicalnet (MedicalNet ResNet-10), resnet50")
     parser.add_argument("--is_fake_3d", action="store_true",
                         help="Use 2.5D (fake 3D) mode for perceptual loss (faster, lower memory)")
-    parser.add_argument("--spectral_reg_weight", type=float, default=0.0,
-                        help="Weight for spectral regularization on encoder conv layers (NVAE). "
-                             "Constrains encoder Lipschitz constant to bound KL scale. "
-                             "Recommended: 1e-4 to 1e-3. Default: 0.0 (disabled)")
+
+    # Consistency training parameters
+    parser.add_argument("--num_variations", type=int, default=1,
+                        help="Number of degradation variations per HR volume for consistency training. "
+                             "1 = standard training (default), 2+ = multi-variation consistency training")
+    parser.add_argument("--consistency_weight", type=float, default=0.2,
+                        help="Weight for output-space consistency loss between variations (default: 0.2)")
+    parser.add_argument("--latent_consistency_weight", type=float, default=0.05,
+                        help="Weight for latent-space consistency loss between PoG posteriors (default: 0.05)")
+    parser.add_argument("--consistency_warmup_steps", type=int, default=5000,
+                        help="Number of steps to linearly warm up consistency losses (default: 5000)")
 
     # Data generation parameters
     parser.add_argument("--atlas_res", type=float, nargs=3, default=[1.0, 1.0, 1.0], help="HR resolution")
@@ -1152,5 +1239,8 @@ if __name__ == "__main__":
         blocks_up=blocks_up,
         num_groups=args.num_groups,
         global_residual=not args.no_global_residual,
-        spectral_reg_weight=args.spectral_reg_weight,
+        num_variations=args.num_variations,
+        consistency_weight=args.consistency_weight,
+        latent_consistency_weight=args.latent_consistency_weight,
+        consistency_warmup_steps=args.consistency_warmup_steps,
     )

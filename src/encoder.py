@@ -10,6 +10,7 @@ Uses RegressionResBlock (normalization-free by default) for regression/SR tasks.
 import torch
 import torch.nn as nn
 from typing import List, Dict, Tuple, Optional
+from torch.nn.utils.parametrizations import spectral_norm
 
 from .blocks import RegressionResBlock
 
@@ -46,7 +47,8 @@ class SegResEncoderBlock(nn.Module):
         # self.pre_var_norm = nn.GroupNorm(min(num_groups, out_channels), out_channels)
 
         # Variational projection: features -> (mu, logvar)
-        self.variational_proj = nn.Conv3d(out_channels, out_channels * 2, kernel_size=1)
+        # self.variational_proj = nn.Conv3d(out_channels, out_channels * 2, kernel_size=1)
+        self.variational_proj = spectral_norm(nn.Conv3d(out_channels, out_channels * 2, kernel_size=1))
         self.out_channels = out_channels
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -94,7 +96,8 @@ class SegResEncoder(nn.Module):
             blocks_per_scale = blocks_per_scale + (blocks_per_scale[-1],) * (num_scales - len(blocks_per_scale))
 
         # Initial convolution (no downsampling)
-        self.init_conv = nn.Conv3d(in_channels, init_filters, kernel_size=3, padding=1)
+        # self.init_conv = nn.Conv3d(in_channels, init_filters, kernel_size=3, padding=1)
+        self.init_conv = spectral_norm(nn.Conv3d(in_channels, init_filters, kernel_size=3, padding=1))
 
         # Encoder blocks
         self.encoder_blocks = nn.ModuleList()

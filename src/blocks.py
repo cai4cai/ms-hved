@@ -10,7 +10,7 @@ Following EDSR/SRResNet/ESRGAN design principles:
 
 import torch
 import torch.nn as nn
-
+from torch.nn.utils.parametrizations import spectral_norm
 
 class RegressionResBlock(nn.Module):
     """
@@ -45,7 +45,8 @@ class RegressionResBlock(nn.Module):
         if use_norm:
             num_groups_1 = min(num_groups, in_channels)
             layers1.append(nn.GroupNorm(num_groups_1, in_channels))
-        layers1.append(nn.Conv3d(in_channels, out_channels, kernel_size, stride, padding))
+        # layers1.append(nn.Conv3d(in_channels, out_channels, kernel_size, stride, padding))
+        layers1.append(spectral_norm(nn.Conv3d(in_channels, out_channels, kernel_size, stride, padding)))
         layers1.append(nn.LeakyReLU(0.2, inplace=False))
         self.path1 = nn.Sequential(*layers1)
 
@@ -54,12 +55,14 @@ class RegressionResBlock(nn.Module):
         if use_norm:
             num_groups_2 = min(num_groups, out_channels)
             layers2.append(nn.GroupNorm(num_groups_2, out_channels))
-        layers2.append(nn.Conv3d(out_channels, out_channels, kernel_size, 1, padding))
+        # layers2.append(nn.Conv3d(out_channels, out_channels, kernel_size, 1, padding))
+        layers2.append(spectral_norm(nn.Conv3d(out_channels, out_channels, kernel_size, 1, padding)))
         self.path2 = nn.Sequential(*layers2)
 
         # Skip connection
         if in_channels != out_channels or stride != 1:
-            self.skip = nn.Conv3d(in_channels, out_channels, 1, stride)
+            # self.skip = nn.Conv3d(in_channels, out_channels, 1, stride)
+            self.skip = spectral_norm(nn.Conv3d(in_channels, out_channels, 1, stride))
         else:
             self.skip = nn.Identity()
 
