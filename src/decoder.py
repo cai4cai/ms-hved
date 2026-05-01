@@ -1,8 +1,7 @@
 """
-SegResNet-style Decoder for MS-HVED
+Decoder for MS-HVED
 
-Uses RegressionResBlock (normalization-free by default) for regression/SR tasks.
-- No GroupNorm on final output head (prevents contrast shifts)
+Uses RegressionResBlock for regression/SR tasks.
 - Hardtanh 'clamp' activation option (gradient=1 in [0,1], unlike sigmoid max 0.25)
 - LeakyReLU(0.2) instead of ReLU
 """
@@ -15,7 +14,7 @@ from typing import List, Optional, Tuple
 from .blocks import RegressionResBlock, UpsampleBlock
 
 
-class SegResDecoderBlock(nn.Module):
+class DecoderBlock(nn.Module):
     """
     Decoder block with upsampling, skip fusion, and RegressionResBlock blocks.
 
@@ -29,8 +28,6 @@ class SegResDecoderBlock(nn.Module):
         out_channels: int,
         num_blocks: int = 1,
         upsample_mode: str = 'trilinear',
-        num_groups: int = 8,
-        use_norm: bool = False,
     ):
         super().__init__()
 
@@ -41,7 +38,7 @@ class SegResDecoderBlock(nn.Module):
         self.skip_proj = nn.Identity() if skip_channels == out_channels else nn.Conv3d(skip_channels, out_channels, 1)
 
         # Residual blocks
-        blocks = [RegressionResBlock(out_channels, out_channels, num_groups=num_groups, use_norm=use_norm) for _ in range(num_blocks)]
+        blocks = [RegressionResBlock(out_channels, out_channels) for _ in range(num_blocks)]
         self.blocks = nn.Sequential(*blocks)
 
     def forward(self, x: torch.Tensor, skip: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -58,9 +55,9 @@ class SegResDecoderBlock(nn.Module):
         return x
 
 
-class SegResDecoder(nn.Module):
+class Decoder(nn.Module):
     """
-    Multi-scale SegResNet-style decoder for MS-HVED.
+    Multi-scale decoder for MS-HVED.
 
     Architecture:
         Deepest latent -> [Upsample + Skip + RegressionResBlocks] x (num_scales-1) -> Output
@@ -75,9 +72,7 @@ class SegResDecoder(nn.Module):
         num_scales: int = 4,
         blocks_per_scale: Tuple[int, ...] = (1, 1, 1),
         upsample_mode: str = 'trilinear',
-        num_groups: int = 8,
         final_activation: str = 'clamp',
-        use_norm: bool = False,
     ):
         """
         Args:
@@ -86,9 +81,7 @@ class SegResDecoder(nn.Module):
             num_scales: Number of scales (matches encoder)
             blocks_per_scale: Residual blocks per decoder level
             upsample_mode: 'trilinear' or 'transpose'
-            num_groups: Groups for GroupNorm (only used when use_norm=True)
             final_activation: 'clamp' (recommended), 'sigmoid', 'tanh', or 'none'
-            use_norm: Whether to use GroupNorm in residual blocks (default False)
         """
         super().__init__()
 
@@ -110,14 +103,12 @@ class SegResDecoder(nn.Module):
             block_idx = num_scales - 1 - i
 
             self.decoder_blocks.append(
-                SegResDecoderBlock(
+                DecoderBlock(
                     in_channels=in_ch,
                     skip_channels=skip_ch,
                     out_channels=out_ch,
                     num_blocks=blocks_per_scale[block_idx],
                     upsample_mode=upsample_mode,
-                    num_groups=num_groups,
-                    use_norm=use_norm,
                 )
             )
 
@@ -162,7 +153,7 @@ class SegResDecoder(nn.Module):
         return x
 
 
-class MultiOutputSegResDecoder(nn.Module):
+class MultiOutputDecoder(nn.Module):
     """
     Decoder producing multiple outputs:
     - Main output (e.g., super-resolved image)
@@ -177,10 +168,8 @@ class MultiOutputSegResDecoder(nn.Module):
         num_scales: int = 4,
         blocks_per_scale: Tuple[int, ...] = (1, 1, 1),
         upsample_mode: str = 'trilinear',
-        num_groups: int = 8,
         share_decoder: bool = False,
         final_activation: str = 'clamp',
-        use_norm: bool = False,
     ):
         super().__init__()
 
@@ -193,20 +182,18 @@ class MultiOutputSegResDecoder(nn.Module):
             num_scales=num_scales,
             blocks_per_scale=blocks_per_scale,
             upsample_mode=upsample_mode,
-            num_groups=num_groups,
             final_activation=final_activation,
-            use_norm=use_norm,
         )
 
         # Main decoder
-        self.main_decoder = SegResDecoder(**decoder_kwargs)
+        self.main_decoder = Decoder(**decoder_kwargs)
 
         # Orientation decoders
         if share_decoder:
-            self.orientation_decoder = SegResDecoder(**decoder_kwargs)
+            self.orientation_decoder = Decoder(**decoder_kwargs)
         else:
             self.orientation_decoders = nn.ModuleList([
-                SegResDecoder(**decoder_kwargs)
+                Decoder(**decoder_kwargs)
                 for _ in range(num_orientations)
             ])
 

@@ -19,3 +19,6 @@ matplotlib
 streamlit
 rich
 gdown
+scikit-image
+antspyx
+SimpleITK

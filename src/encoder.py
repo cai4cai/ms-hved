@@ -1,10 +1,10 @@
 """
-SegResNet-style Encoder for MS-HVED
+Encoder for MS-HVED
 
-Uses RegressionResBlock (normalization-free by default) for regression/SR tasks.
+Uses RegressionResBlock for regression/SR tasks.
 - LeakyReLU(0.2) instead of ReLU (avoids dead neurons)
-- No GroupNorm by default (preserves intensity information for SR)
 - Residual scaling for training stability
+- Spectral regularization for kl wieght norm and kl stability
 """
 
 import torch
@@ -15,7 +15,7 @@ from torch.nn.utils.parametrizations import spectral_norm
 from .blocks import RegressionResBlock
 
 
-class SegResEncoderBlock(nn.Module):
+class EncoderBlock(nn.Module):
     """
     Encoder block with RegressionResBlock residual blocks.
     Outputs variational parameters (mu, logvar).
@@ -27,27 +27,20 @@ class SegResEncoderBlock(nn.Module):
         out_channels: int,
         num_blocks: int = 1,
         downsample: bool = True,
-        num_groups: int = 8,
-        use_norm: bool = False,
     ):
         super().__init__()
 
         # First block handles channel change and optional downsampling
         stride = 2 if downsample else 1
-        blocks = [RegressionResBlock(in_channels, out_channels, stride=stride, num_groups=num_groups, use_norm=use_norm)]
+        blocks = [RegressionResBlock(in_channels, out_channels, stride=stride)]
 
         # Additional blocks at same resolution
         for _ in range(num_blocks - 1):
-            blocks.append(RegressionResBlock(out_channels, out_channels, num_groups=num_groups, use_norm=use_norm))
+            blocks.append(RegressionResBlock(out_channels, out_channels))
 
         self.blocks = nn.Sequential(*blocks)
 
-        # pre_var_norm commented out: NaN was caused by fp16 overflow in fusion,
-        # not mu explosion. Norm conflicts with norm-free encoder design for SR.
-        # self.pre_var_norm = nn.GroupNorm(min(num_groups, out_channels), out_channels)
-
         # Variational projection: features -> (mu, logvar)
-        # self.variational_proj = nn.Conv3d(out_channels, out_channels * 2, kernel_size=1)
         self.variational_proj = spectral_norm(nn.Conv3d(out_channels, out_channels * 2, kernel_size=1))
         self.out_channels = out_channels
 
@@ -59,8 +52,6 @@ class SegResEncoderBlock(nn.Module):
             logvar: Variational log-variance (clamped to [-5, 5])
         """
         features = self.blocks(x)
-        # Bypass pre_var_norm — project features directly (see __init__ comment)
-        # features = self.pre_var_norm(features)
         params = self.variational_proj(features)
 
         mu = params[:, :self.out_channels]
@@ -69,9 +60,9 @@ class SegResEncoderBlock(nn.Module):
         return features, mu, logvar
 
 
-class SegResEncoder(nn.Module):
+class Encoder(nn.Module):
     """
-    Multi-scale SegResNet-style encoder for MS-HVED.
+    Multi-scale encoder for MS-HVED.
 
     Architecture:
         Input -> InitConv -> [RegressionResBlock x n] per scale with downsampling
@@ -84,8 +75,6 @@ class SegResEncoder(nn.Module):
         init_filters: int = 32,
         num_scales: int = 4,
         blocks_per_scale: Tuple[int, ...] = (1, 2, 2, 4),
-        num_groups: int = 8,
-        use_norm: bool = False,
     ):
         super().__init__()
 
@@ -96,7 +85,6 @@ class SegResEncoder(nn.Module):
             blocks_per_scale = blocks_per_scale + (blocks_per_scale[-1],) * (num_scales - len(blocks_per_scale))
 
         # Initial convolution (no downsampling)
-        # self.init_conv = nn.Conv3d(in_channels, init_filters, kernel_size=3, padding=1)
         self.init_conv = spectral_norm(nn.Conv3d(in_channels, init_filters, kernel_size=3, padding=1))
 
         # Encoder blocks
@@ -108,13 +96,11 @@ class SegResEncoder(nn.Module):
             downsample = (i > 0)  # First scale stays at input resolution
 
             self.encoder_blocks.append(
-                SegResEncoderBlock(
+                EncoderBlock(
                     in_channels=in_ch,
                     out_channels=out_ch,
                     num_blocks=blocks_per_scale[i],
                     downsample=downsample,
-                    num_groups=num_groups,
-                    use_norm=use_norm,
                 )
             )
             in_ch = out_ch
@@ -137,7 +123,7 @@ class SegResEncoder(nn.Module):
         return outputs
 
 
-class MultiModalSegResEncoder(nn.Module):
+class MultiModalEncoder(nn.Module):
     """
     Multi-orientation encoder using RegressionResBlock blocks.
     Each orientation encoded independently, then fused via Product of Gaussians.
@@ -150,9 +136,7 @@ class MultiModalSegResEncoder(nn.Module):
         init_filters: int = 32,
         num_scales: int = 4,
         blocks_per_scale: Tuple[int, ...] = (1, 2, 2, 4),
-        num_groups: int = 8,
         share_weights: bool = False,
-        use_norm: bool = False,
     ):
         super().__init__()
 
@@ -161,13 +145,13 @@ class MultiModalSegResEncoder(nn.Module):
         self.num_scales = num_scales
 
         if share_weights:
-            self.encoder = SegResEncoder(
-                in_channels, init_filters, num_scales, blocks_per_scale, num_groups, use_norm=use_norm
+            self.encoder = Encoder(
+                in_channels, init_filters, num_scales, blocks_per_scale
             )
             self.hidden_dims = self.encoder.hidden_dims
         else:
             self.encoders = nn.ModuleList([
-                SegResEncoder(in_channels, init_filters, num_scales, blocks_per_scale, num_groups, use_norm=use_norm)
+                Encoder(in_channels, init_filters, num_scales, blocks_per_scale)
                 for _ in range(num_orientations)
             ])
             self.hidden_dims = self.encoders[0].hidden_dims

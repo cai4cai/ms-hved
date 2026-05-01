@@ -1,11 +1,12 @@
 """
 Shared building blocks for MS-HVED encoder and decoder.
 
-RegressionResBlock: Normalization-free residual block optimized for regression/SR tasks.
+RegressionResBlock: Residual block optimized for regression/SR tasks.
 Following EDSR/SRResNet/ESRGAN design principles:
-- No GroupNorm by default (preserves intensity/contrast information)
 - LeakyReLU(0.2) instead of ReLU (avoids dead neurons)
 - Residual scaling (stabilizes deep networks)
+And NVAE:
+- Spectral regularization for unbounded KL divergences
 """
 
 import torch
@@ -14,15 +15,13 @@ from torch.nn.utils.parametrizations import spectral_norm
 
 class RegressionResBlock(nn.Module):
     """
-    Normalization-free residual block for regression/super-resolution.
+    Residual block for regression/super-resolution.
 
     Structure: Conv3d -> LeakyReLU -> Conv3d -> * residual_scale -> + skip
 
     Key design choices:
-    - No GroupNorm by default (EDSR/SRResNet: normalization removes intensity info)
     - LeakyReLU(0.2, inplace=False) avoids dead neurons and gradient corruption
     - Residual scaling (default 0.2) prevents instability in deep networks (EDSR)
-    - Optional use_norm flag for ablation studies
     """
 
     def __init__(
@@ -31,8 +30,6 @@ class RegressionResBlock(nn.Module):
         out_channels: int,
         kernel_size: int = 3,
         stride: int = 1,
-        num_groups: int = 8,
-        use_norm: bool = False,
         residual_scale: float = 0.2,
     ):
         super().__init__()
@@ -42,26 +39,17 @@ class RegressionResBlock(nn.Module):
 
         # First conv path
         layers1 = []
-        if use_norm:
-            num_groups_1 = min(num_groups, in_channels)
-            layers1.append(nn.GroupNorm(num_groups_1, in_channels))
-        # layers1.append(nn.Conv3d(in_channels, out_channels, kernel_size, stride, padding))
         layers1.append(spectral_norm(nn.Conv3d(in_channels, out_channels, kernel_size, stride, padding)))
         layers1.append(nn.LeakyReLU(0.2, inplace=False))
         self.path1 = nn.Sequential(*layers1)
 
         # Second conv path
         layers2 = []
-        if use_norm:
-            num_groups_2 = min(num_groups, out_channels)
-            layers2.append(nn.GroupNorm(num_groups_2, out_channels))
-        # layers2.append(nn.Conv3d(out_channels, out_channels, kernel_size, 1, padding))
         layers2.append(spectral_norm(nn.Conv3d(out_channels, out_channels, kernel_size, 1, padding)))
         self.path2 = nn.Sequential(*layers2)
 
         # Skip connection
         if in_channels != out_channels or stride != 1:
-            # self.skip = nn.Conv3d(in_channels, out_channels, 1, stride)
             self.skip = spectral_norm(nn.Conv3d(in_channels, out_channels, 1, stride))
         else:
             self.skip = nn.Identity()
@@ -76,7 +64,6 @@ class RegressionResBlock(nn.Module):
 class UpsampleBlock(nn.Module):
     """
     Upsampling block with trilinear interpolation or transposed convolution.
-    Same as SegResUpsampleBlock — no normalization changes needed.
     """
 
     def __init__(

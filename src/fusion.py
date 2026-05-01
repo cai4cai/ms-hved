@@ -38,7 +38,9 @@ class ProductOfGaussians(nn.Module):
         prior_mu: float = 0.0,
         prior_logvar: float = 0.0,
         eps: float = 1e-7,
-        interp_attenuation: float = 0.5,
+        fov_attenuation: float = 1.0,
+        smooth_fov: bool = True,
+        fov_transition_width: float = 3.0,
     ):
         """
         Args:
@@ -46,9 +48,19 @@ class ProductOfGaussians(nn.Module):
             prior_mu: Prior mean (default 0)
             prior_logvar: Prior log-variance (default 0, i.e., var=1)
             eps: Small constant for numerical stability
-            interp_attenuation: How much to reduce precision for interpolated
-                voxels (0.0 = no reduction, 1.0 = zero out completely).
-                Default 0.5 means interpolated voxels contribute half precision.
+            fov_attenuation: Controls the *depth* of precision suppression for
+                missing (out-of-FOV) voxels, i.e. how much precision is removed
+                at the worst point. Applied as: confidence = 1 - mask * attenuation.
+                1.0 = fully suppress missing voxels (confidence → 0).
+                0.5 = retain half precision for missing voxels.
+                0.0 = no suppression (FOV masking effectively disabled).
+                Independent of smooth_fov, which controls the *shape* (hard vs
+                gradual) of the transition at FOV boundaries.
+            smooth_fov: Whether to apply Gaussian smoothing to FOV masks.
+                False = original hard binary boundary. Default True.
+            fov_transition_width: Sigma (in voxels) of the Gaussian kernel used
+                to smooth FOV boundaries. Only used when smooth_fov=True.
+                Default 3.0.
         """
         super().__init__()
 
@@ -56,14 +68,77 @@ class ProductOfGaussians(nn.Module):
         self.prior_mu = prior_mu
         self.prior_logvar = prior_logvar
         self.eps = eps
-        self.interp_attenuation = interp_attenuation
+        self.fov_attenuation = fov_attenuation
+        self.smooth_fov = smooth_fov
+        self.fov_transition_width = fov_transition_width
+        self._kernel_cache: Dict[Tuple[float, str], torch.Tensor] = {}
+
+    @staticmethod
+    def _make_gaussian_kernel_3d(sigma: float, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """Create a normalised 3D Gaussian kernel (1,1,K,K,K) for conv3d."""
+        radius = max(int(3 * sigma + 0.5), 1)  # 3-sigma rule
+        size = 2 * radius + 1
+        coords = torch.arange(size, device=device, dtype=dtype) - radius
+        g1d = torch.exp(-0.5 * (coords / sigma) ** 2)
+        g3d = g1d[:, None, None] * g1d[None, :, None] * g1d[None, None, :]
+        g3d = g3d / g3d.sum()
+        return g3d.reshape(1, 1, size, size, size)
+
+    def smooth_fov_mask(self, fov_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Smooth a binary FOV mask into a continuous confidence map.
+
+        The idea:
+        - Convolve the binary *missing* mask (1=missing) with a Gaussian kernel.
+        - The result tells each voxel "how much missingness is nearby".
+        - confidence = 1 - blurred_missing * attenuation
+
+        Properties:
+        - Voxels deep inside the valid FOV → confidence ≈ 1 (unaffected)
+        - Voxels near the FOV boundary    → confidence smoothly decreases
+        - Voxels fully outside FOV         → confidence ≈ 0 (when attenuation=1)
+        - Background boundaries are NOT affected because we only blur the
+          geometric FOV mask, not any content. The falloff lives strictly
+          within the FOV transition zone.
+
+        Args:
+            fov_mask: (B, 1, D, H, W), 1=missing/out-of-FOV, 0=valid
+
+        Returns:
+            confidence: (B, 1, D, H, W) in [0, 1]
+        """
+        sigma = self.fov_transition_width
+        if not self.smooth_fov or sigma <= 0:
+            # No smoothing — original hard boundary
+            return 1.0 - fov_mask.float() * self.fov_attenuation
+
+        # Cache kernel per (sigma, device) to avoid re-creation every call
+        cache_key = (sigma, str(fov_mask.device))
+        if cache_key not in self._kernel_cache:
+            self._kernel_cache[cache_key] = self._make_gaussian_kernel_3d(
+                sigma, fov_mask.device, torch.float32
+            )
+        kernel = self._kernel_cache[cache_key]
+
+        mask_f = fov_mask.float()
+        pad = kernel.shape[-1] // 2
+        # Replicate-pad so FOV edges beyond the volume don't introduce zeros
+        blurred = F.conv3d(
+            F.pad(mask_f, [pad] * 6, mode='replicate'),
+            kernel
+        )
+        # blurred is in [0, 1]: 0 = fully valid neighbourhood, 1 = fully missing
+        blurred = blurred.clamp(0.0, 1.0)
+
+        confidence = 1.0 - blurred * self.fov_attenuation
+        return confidence
 
     def forward(
         self,
         mus: Dict[int, torch.Tensor],
         logvars: Dict[int, torch.Tensor],
         orientation_mask: Optional[torch.Tensor] = None,
-        interp_masks: Optional[Dict[int, torch.Tensor]] = None,
+        fov_masks: Optional[Dict[int, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute fused posterior via product of Gaussians.
@@ -74,9 +149,9 @@ class ProductOfGaussians(nn.Module):
             orientation_mask: Optional boolean tensor indicating which orientations to include
                           - Shape (num_orientations,): same mask for all batch elements
                           - Shape (B, num_orientations): different mask per batch element
-            interp_masks: Optional dict mapping orientation index to interpolation mask
-                          (B, 1, D, H, W). 1 = interpolated slice, 0 = acquired slice.
-                          Interpolated voxels have their precision attenuated.
+            fov_masks: Optional dict mapping orientation index to FOV mask
+                          (B, 1, D, H, W). 1 = missing (out-of-FOV), 0 = valid.
+                          Missing voxels have their precision attenuated.
 
         Returns:
             posterior_mu: Fused mean (B, C, D, H, W)
@@ -123,15 +198,13 @@ class ProductOfGaussians(nn.Module):
                 batch_mask = 1.0
 
             # Compute precision (inverse variance)
-            # Clamp logvar to prevent overflow/underflow: exp(-20) to exp(20)
+            # Clamp logvar to prevent overflow/underflow: exp(-10) to exp(10)
             logvar_clamped = torch.clamp(logvar, min=-10.0, max=10.0)
             precision = 1.0 / (torch.exp(logvar_clamped) + self.eps)
 
-            # Attenuate precision for interpolated voxels
-            if interp_masks is not None and mod_idx in interp_masks:
-                # interp_mask: (B, 1, D, H, W), 1=interpolated, 0=acquired
-                # confidence: 1.0 for acquired, (1 - attenuation) for interpolated
-                confidence = 1.0 - interp_masks[mod_idx].float() * self.interp_attenuation
+            # Attenuate precision for missing (out-of-FOV) voxels with smooth falloff
+            if fov_masks is not None and mod_idx in fov_masks:
+                confidence = self.smooth_fov_mask(fov_masks[mod_idx])
                 precision = precision * confidence
 
             # Apply mask to precision (zeros out contribution from masked batch elements)
@@ -202,7 +275,7 @@ class GaussianSampler(nn.Module):
         logvar = logvar.float()
 
         # Reparameterization trick
-        # Clamp logvar to prevent overflow: exp(0.5 * 20) is still manageable
+        # Clamp logvar to prevent overflow: exp(0.5 * 10) is still manageable
         logvar_clamped = torch.clamp(logvar, min=-10.0, max=10.0)
         std = torch.exp(0.5 * logvar_clamped) + eps
         noise = torch.randn_like(mu)
@@ -220,24 +293,35 @@ class MultiScaleFusion(nn.Module):
     def __init__(
         self,
         num_scales: int = 4,
-        use_prior: bool = True
+        use_prior: bool = True,
+        smooth_fov: bool = True,
+        fov_attenuation: float = 1.0,
+        fov_transition_width: float = 3.0,
     ):
         """
         Args:
             num_scales: Number of spatial scales
             use_prior: Whether to use prior in PoG fusion
+            smooth_fov: Whether to smooth FOV mask boundaries
+            fov_attenuation: Attenuation factor for FOV masks (0=no attenuation, 1=full attenuation)
+            fov_transition_width: Gaussian sigma for FOV smoothing (voxels)
         """
         super().__init__()
 
         self.num_scales = num_scales
-        self.fusion = ProductOfGaussians(use_prior=use_prior)
+        self.fusion = ProductOfGaussians(
+            use_prior=use_prior,
+            smooth_fov=smooth_fov,
+            fov_attenuation=fov_attenuation,
+            fov_transition_width=fov_transition_width,
+        )
         self.sampler = GaussianSampler()
 
     def forward(
         self,
         encoder_outputs: List[Dict[str, Dict[int, torch.Tensor]]],
         orientation_mask: Optional[torch.Tensor] = None,
-        interp_masks: Optional[List[torch.Tensor]] = None,
+        fov_masks: Optional[List[torch.Tensor]] = None,
         deterministic: bool = False
     ) -> Tuple[List[torch.Tensor], List[Tuple[torch.Tensor, torch.Tensor]]]:
         """
@@ -247,7 +331,7 @@ class MultiScaleFusion(nn.Module):
             encoder_outputs: List (per scale) of dicts with 'mu' and 'logvar'
                             dicts mapping orientation indices to tensors
             orientation_mask: Boolean tensor indicating present orientations
-            interp_masks: Optional list of 3 interpolation masks at full resolution,
+            fov_masks: Optional list of 3 FOV masks at full resolution,
                          each (B, 1, D, H, W). Downsampled to match each scale.
             deterministic: If True, return means without sampling
 
@@ -266,22 +350,22 @@ class MultiScaleFusion(nn.Module):
             if len(mus) == 0:
                 continue
 
-            # Downsample interpolation masks to match this scale's spatial dims
-            scale_interp_masks = None
-            if interp_masks is not None:
+            # Downsample FOV masks to match this scale's spatial dims
+            scale_fov_masks = None
+            if fov_masks is not None:
                 ref_spatial = next(iter(mus.values())).shape[2:]  # (D, H, W) at this scale
-                scale_interp_masks = {}
-                for ori_idx, mask in enumerate(interp_masks):
+                scale_fov_masks = {}
+                for ori_idx, mask in enumerate(fov_masks):
                     if ori_idx not in mus:
                         continue
                     if list(mask.shape[2:]) != list(ref_spatial):
-                        # max_pool preserves interpolated markers (1s) through downsampling
+                        # max_pool preserves missing markers (1s) through downsampling
                         mask = F.adaptive_max_pool3d(mask.float(), ref_spatial)
-                    scale_interp_masks[ori_idx] = mask
+                    scale_fov_masks[ori_idx] = mask
 
             # Fuse via Product of Gaussians
             fused_mu, fused_logvar = self.fusion(
-                mus, logvars, orientation_mask, interp_masks=scale_interp_masks
+                mus, logvars, orientation_mask, fov_masks=scale_fov_masks
             )
 
             # Sample

@@ -5,12 +5,10 @@ The training objective combines:
 1. Reconstruction loss: How well the network reconstructs the target
 2. KL divergence: Regularization for the variational latent space
 3. Perceptual loss: High-level feature matching for better visual quality
-4. Adversarial loss (optional): For GAN-based training
-
-For super-resolution, we adapt the original U-HVED losses:
-- Instead of segmentation loss, we use image reconstruction loss
-- KL divergence remains the same (regularizes the shared latent space)
-- Added perceptual and adversarial losses for better SR quality
+4. SSIM loss: Structural similarity for better perceptual quality
+5. Orientation reconstruction loss: For accurate orientation estimation
+6. Output consistency loss: Ensures consistent SR outputs across different degradations
+7. Latent consistency loss: Ensures consistent latent representations across degradations
 """
 
 import torch
@@ -300,12 +298,16 @@ class MSHVEDLoss(nn.Module):
                + perceptual_weight * L_perceptual_3d
                + ssim_weight * L_ssim_3d
                + orientation_weight * L_orientation_recon
+                + consistency_weight * L_output_consistency
+                + latent_consistency_weight * L_latent_consistency
+
 
     Features:
     - Supports multiple 3D perceptual loss backends
     - Uses MONAI's SSIM3D
     - Maintains all original loss components
     - KL annealing support
+    - Consistency losses across degradation variations
     """
 
     def __init__(

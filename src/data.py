@@ -18,7 +18,6 @@ import numpy as np
 import math
 from pathlib import Path
 from typing import Optional, List, Union, Tuple, Dict
-
 from monai.data import Dataset, CacheDataset
 from monai.transforms import (
     Compose, LoadImaged, EnsureChannelFirstd, Orientationd,
@@ -26,7 +25,6 @@ from monai.transforms import (
     ToTensord, ScaleIntensityRangePercentiles,
     CenterSpatialCropd, RandAffined,
 )
-
 
 
 class SliceProfilePhysics(nn.Module):
@@ -526,6 +524,215 @@ class SampleResolution(nn.Module):
             return resolution
 
 
+# ---- Utility Functions for Affine Transformations and Resampling ---
+def euler_to_rotation_matrix(
+    rx: float, ry: float, rz: float, device: torch.device = None
+) -> torch.Tensor:
+    """Convert Euler angles (radians) to a 3x3 rotation matrix.
+
+    Uses extrinsic Rz @ Ry @ Rx convention.
+
+    Args:
+        rx: Rotation around x-axis in radians.
+        ry: Rotation around y-axis in radians.
+        rz: Rotation around z-axis in radians.
+        device: Torch device for the output.
+
+    Returns:
+        3x3 rotation matrix.
+    """
+    cx, sx = math.cos(rx), math.sin(rx)
+    cy, sy = math.cos(ry), math.sin(ry)
+    cz, sz = math.cos(rz), math.sin(rz)
+
+    # fmt: off
+    R = torch.tensor([
+        [cy * cz, sx * sy * cz - cx * sz, cx * sy * cz + sx * sz],
+        [cy * sz, sx * sy * sz + cx * cz, cx * sy * sz - sx * cz],
+        [-sy,     sx * cy,                cx * cy               ],
+    ], dtype=torch.float32, device=device)
+    # fmt: on
+    return R
+
+
+def build_lr_affine(
+    hr_affine: torch.Tensor,
+    through_plane_axis: int,
+    lr_spacing_tp: float,
+    hr_spacing_tp: float,
+    lr_shape: Tuple[int, int, int],
+    hr_shape: Tuple[int, int, int],
+    rotation_angles: Optional[Tuple[float, float, float]] = None,
+) -> torch.Tensor:
+    """Build the LR native-space affine matrix.
+
+    Starts from the HR affine, scales the through-plane column to reflect
+    the LR voxel spacing, optionally applies a rotation (obliqueness), and
+    adjusts the translation so the LR and HR FOV centers coincide in world
+    space.
+
+    Args:
+        hr_affine: 4x4 HR grid affine matrix.
+        through_plane_axis: Index (0, 1, or 2) of the through-plane axis.
+        lr_spacing_tp: LR voxel spacing along the through-plane axis (mm).
+        hr_spacing_tp: HR voxel spacing along the through-plane axis (mm).
+        lr_shape: Spatial shape (D, H, W) of the native LR volume.
+        hr_shape: Spatial shape (D, H, W) of the HR target grid.
+        rotation_angles: Optional (rx, ry, rz) in radians for obliqueness.
+
+    Returns:
+        4x4 LR affine matrix.
+    """
+    device = hr_affine.device
+    T_lr = hr_affine.clone()
+
+    # Scale through-plane column to LR spacing
+    scale = lr_spacing_tp / hr_spacing_tp
+    T_lr[:3, through_plane_axis] = T_lr[:3, through_plane_axis] * scale
+
+    # Apply rotation (obliqueness)
+    if rotation_angles is not None:
+        rx, ry, rz = rotation_angles
+        R = euler_to_rotation_matrix(rx, ry, rz, device=device)
+        T_lr[:3, :3] = R @ T_lr[:3, :3]
+
+    # Align centers: compute world-space center of HR and LR FOVs
+    hr_center = torch.tensor(
+        [(s - 1) / 2.0 for s in hr_shape], dtype=torch.float32, device=device
+    )
+    lr_center = torch.tensor(
+        [(s - 1) / 2.0 for s in lr_shape], dtype=torch.float32, device=device
+    )
+
+    # World-space positions of the centers
+    hr_center_world = hr_affine[:3, :3] @ hr_center + hr_affine[:3, 3]
+    lr_center_world = T_lr[:3, :3] @ lr_center + T_lr[:3, 3]
+
+    # Shift LR origin so centers coincide
+    T_lr[:3, 3] += hr_center_world - lr_center_world
+
+    return T_lr
+
+
+def affine_resample_3d(
+    volume: torch.Tensor,
+    source_affine: torch.Tensor,
+    target_affine: torch.Tensor,
+    target_shape: Tuple[int, int, int],
+    mode: str = "bilinear",
+) -> torch.Tensor:
+    """Resample a 3D volume between coordinate systems using affine matrices.
+
+    For each voxel in the target grid, computes the corresponding source-space
+    coordinate via ``M = inv(T_source) @ T_target`` and samples using
+    ``grid_sample``.
+
+    Args:
+        volume: Source volume (C, D, H, W).
+        source_affine: 4x4 affine of the source volume.
+        target_affine: 4x4 affine of the target grid.
+        target_shape: Spatial dimensions (D, H, W) of the target grid.
+        mode: Interpolation mode — ``'bilinear'`` or ``'nearest'``.
+
+    Returns:
+        Resampled volume (C, *target_shape).
+    """
+    device = volume.device
+    C = volume.shape[0]
+    src_shape = volume.shape[1:]  # (D_s, H_s, W_s)
+    tgt_D, tgt_H, tgt_W = target_shape
+
+    # Mapping: target voxel -> source voxel
+    M = torch.linalg.inv(source_affine) @ target_affine  # (4, 4)
+
+    # Build meshgrid of target voxel coordinates
+    grid_d = torch.arange(tgt_D, dtype=torch.float32, device=device)
+    grid_h = torch.arange(tgt_H, dtype=torch.float32, device=device)
+    grid_w = torch.arange(tgt_W, dtype=torch.float32, device=device)
+    # (D, H, W) grids
+    gd, gh, gw = torch.meshgrid(grid_d, grid_h, grid_w, indexing="ij")
+
+    # Homogeneous coordinates: (D*H*W, 4)
+    ones = torch.ones_like(gd)
+    coords = torch.stack([gd, gh, gw, ones], dim=-1)  # (D, H, W, 4)
+    coords_flat = coords.reshape(-1, 4)  # (N, 4)
+
+    # Transform to source voxel space: (4, 4) @ (4, N) -> (4, N)
+    src_coords = (M @ coords_flat.T).T[:, :3]  # (N, 3) — (d, h, w)
+
+    # Normalize to [-1, 1] for grid_sample (align_corners=True)
+    # grid_sample expects (x, y, z) = (W, H, D) ordering
+    src_d = src_coords[:, 0]
+    src_h = src_coords[:, 1]
+    src_w = src_coords[:, 2]
+
+    norm_w = 2.0 * src_w / (src_shape[2] - 1) - 1.0 if src_shape[2] > 1 else src_w * 0.0
+    norm_h = 2.0 * src_h / (src_shape[1] - 1) - 1.0 if src_shape[1] > 1 else src_h * 0.0
+    norm_d = 2.0 * src_d / (src_shape[0] - 1) - 1.0 if src_shape[0] > 1 else src_d * 0.0
+
+    # grid_sample 5D: input (N, C, D, H, W), grid (N, D, H, W, 3) with last dim = (x, y, z) = (W, H, D)
+    grid = torch.stack([norm_w, norm_h, norm_d], dim=-1)  # (N, 3)
+    grid = grid.reshape(1, tgt_D, tgt_H, tgt_W, 3)  # (1, D, H, W, 3)
+
+    # Add batch dim to volume: (1, C, D_s, H_s, W_s)
+    vol_5d = volume.unsqueeze(0)
+
+    resampled = F.grid_sample(
+        vol_5d, grid, mode=mode, padding_mode="zeros", align_corners=True
+    )
+
+    return resampled.squeeze(0)  # (C, D, H, W)
+
+
+def resample_with_fov_mask(
+    lr_volume: torch.Tensor,
+    lr_affine: torch.Tensor,
+    hr_affine: torch.Tensor,
+    hr_shape: Tuple[int, int, int],
+    mode: str = "bilinear",
+    support_mask: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Resample an LR volume to the HR grid and compute the FOV mask.
+
+    Uses the "dummy mask trick": resamples a mask volume alongside the
+    actual image. Out-of-bounds voxels become 0, producing a binary FOV
+    validity mask. If ``support_mask`` is provided it replaces the default
+    all-ones dummy, encoding which LR voxels survived the FOV slice drop.
+
+    Args:
+        lr_volume: Native LR volume (C, D', H', W').
+        lr_affine: 4x4 affine of the LR volume.
+        hr_affine: 4x4 affine of the HR target grid.
+        hr_shape: Spatial dimensions (D, H, W) of the HR grid.
+        mode: Interpolation mode for the image (``'bilinear'``).
+        support_mask: Optional (1, D', H', W') binary mask where 1 means the
+            voxel is valid. When ``None``, an all-ones mask is used.
+
+    Returns:
+        Tuple of (resampled_image, fov_mask), each (C, D, H, W).
+        ``fov_mask`` is 1 where voxels are **missing** (out-of-bounds in the
+        LR stack or dropped by FOV slice drop), 0 where valid LR data exists.
+    """
+    # Resample image
+    resampled_image = affine_resample_3d(
+        lr_volume, lr_affine, hr_affine, hr_shape, mode=mode
+    )
+
+    # Resample mask with nearest-neighbor
+    # The raw result is 1 where valid, 0 where out-of-bounds or dropped.
+    # Invert so that 1 = missing, 0 = valid.
+    if support_mask is not None:
+        dummy = support_mask
+    else:
+        dummy = torch.ones(1, *lr_volume.shape[1:], device=lr_volume.device)
+    validity_mask = affine_resample_3d(
+        dummy, lr_affine, hr_affine, hr_shape, mode="nearest"
+    )
+    fov_mask = 1.0 - validity_mask
+
+    return resampled_image, fov_mask
+
+
 # ---  Artifact Helpers (Motion, Spikes, Aliasing) ---
 
 def apply_kspace_motion_ghosting(volume: torch.Tensor, axis: int, intensity: float = 0.5, num_ghosts: int = 2) -> torch.Tensor:
@@ -587,6 +794,56 @@ def apply_aliasing(volume: torch.Tensor, axis: int, fold_pct: float = 0.2) -> to
     return (volume + wrapped) / 1.5
 
 
+# --- FOV Slice Drop Helper ---
+
+def _apply_fov_slice_drop(
+    volume: torch.Tensor,
+    through_plane_axis: int,
+    keep_fraction: float,
+    force_both_sides: bool = True,
+) -> torch.Tensor:
+    """Zero out edge slices along the through-plane axis.
+
+    Args:
+        volume: (C, D, H, W) tensor.
+        through_plane_axis: Spatial axis index (0=D, 1=H, 2=W).
+        keep_fraction: Fraction of slices to keep (0, 1].
+        force_both_sides: If True, drop from both ends equally.
+
+    Returns:
+        Same-shape tensor with edge slices zeroed.
+    """
+    output = volume.clone()
+    axis = through_plane_axis + 1  # offset for channel dim
+    axis_size = volume.shape[axis]
+    n_keep = max(1, int(axis_size * keep_fraction))
+    n_drop = axis_size - n_keep
+
+    if n_drop == 0:
+        return output
+
+    if force_both_sides:
+        drop_left = n_drop // 2
+        drop_right = n_drop - drop_left
+        slices_left = [slice(None)] * volume.ndim
+        slices_left[axis] = slice(0, drop_left)
+        output[tuple(slices_left)] = 0
+        if drop_right > 0:
+            slices_right = [slice(None)] * volume.ndim
+            slices_right[axis] = slice(axis_size - drop_right, axis_size)
+            output[tuple(slices_right)] = 0
+    else:
+        drop_from_start = torch.rand(1).item() < 0.5
+        slices = [slice(None)] * volume.ndim
+        if drop_from_start:
+            slices[axis] = slice(0, n_drop)
+        else:
+            slices[axis] = slice(axis_size - n_drop, axis_size)
+        output[tuple(slices)] = 0
+
+    return output
+
+
 # ---  Main Simulator Class ---
 
 class MRIArtifactSimulator(torch.nn.Module):
@@ -617,6 +874,9 @@ class MRIArtifactSimulator(torch.nn.Module):
         spike_intensity: float = 0.04,
         upsample_mode: str = "nearest",
         preserve_input_shape: bool = False,
+        enable_obliqueness: bool = False,
+        prob_obliqueness: float = 0.5,
+        obliqueness_range: float = 15.0,
     ):
         super().__init__()
         self.volume_res = torch.tensor(volume_res, dtype=torch.float32)
@@ -631,6 +891,9 @@ class MRIArtifactSimulator(torch.nn.Module):
         self.spike_intensity = spike_intensity
         self.upsample_mode = upsample_mode
         self.preserve_input_shape = preserve_input_shape
+        self.enable_obliqueness = enable_obliqueness
+        self.prob_obliqueness = prob_obliqueness
+        self.obliqueness_range = obliqueness_range
         self.physics_engine = SliceProfilePhysics(profile_type='trapezoid', edge_width=0.1)
 
     def forward(
@@ -645,6 +908,9 @@ class MRIArtifactSimulator(torch.nn.Module):
         motion_axis: Optional[torch.Tensor] = None,
         aliasing_axis: Optional[torch.Tensor] = None,
         return_intermediate: bool = False,
+        fov_drop_decision: Optional[torch.Tensor] = None,
+        fov_keep_fraction: Optional[torch.Tensor] = None,
+        fov_force_both_sides: bool = True,
     ) -> torch.Tensor:
         """
         Apply MRI artifact simulation.
@@ -659,16 +925,19 @@ class MRIArtifactSimulator(torch.nn.Module):
             enable_noise: Pre-sampled bool mask (B,) for noise
             motion_axis: Pre-sampled axis (B,) for motion direction
             aliasing_axis: Pre-sampled axis (B,) for aliasing direction
+            fov_drop_decision: Per-batch bool (B,) — True to apply FOV drop.
+            fov_keep_fraction: Per-batch float (B,) — fraction of slices to keep.
+            fov_force_both_sides: Drop from both ends of the through-plane axis.
 
         Returns:
-            Tuple of (simulated_lr, interp_masks) where interp_masks (B, 1, D, H, W) marks
-            interpolated slices (1) vs acquired slices (0). If return_intermediate=True,
-            returns (simulated_lr, true_lr, interp_masks).
+            Tuple of (simulated_lr, fov_masks) where fov_masks (B, 1, D, H, W) marks
+            missing voxels (1) vs valid voxels (0). If return_intermediate=True,
+            returns (simulated_lr, true_lr, fov_masks).
         """
         batch_size = image.shape[0]
         device = image.device
         outputs = []
-        interp_mask_outputs = []
+        fov_mask_outputs = []
         true_lr_outputs = [] if return_intermediate else None
 
         for b in range(batch_size):
@@ -755,47 +1024,111 @@ class MRIArtifactSimulator(torch.nn.Module):
                 scale_factor = new_size / original_shape[spatial_axis]
                 img = torch.real(torch.fft.ifftn(cropped_fft, dim=(1, 2, 3))) * scale_factor
 
-                # Capture true LR if requested (before upsample)
-                if return_intermediate:
-                    true_lr_img = img.clone()
+                # FOV slice drop at native LR resolution
+                if (
+                    fov_drop_decision is not None
+                    and fov_drop_decision[b].item()
+                    and fov_keep_fraction is not None
+                ):
+                    keep_frac = fov_keep_fraction[b].item()
+                    img = _apply_fov_slice_drop(
+                        img, downsample_axis, keep_frac, fov_force_both_sides,
+                    )
 
                 # Determine target shape based on configuration
                 if self.preserve_input_shape:
-                    # Upsample back to original input shape
                     target_shape = original_input_shape
                 elif self.output_shape is not None:
-                    # Use fixed output shape (original behavior)
                     target_shape = self.output_shape
                 else:
-                    # No target specified and no flag set - keep current size
-                    target_shape = None
+                    target_shape = original_input_shape
 
-                # Upsample if target_shape is specified and differs from current
-                if target_shape is not None and list(img.shape[1:]) != list(target_shape):
-                    img = torch.nn.functional.interpolate(
-                        img.unsqueeze(0),
-                        size=target_shape,
-                        mode=self.upsample_mode,
-                    ).squeeze(0)
+                if self.enable_obliqueness:
+                    # --- Affine-based resampling path ---
+                    vol_res = self.volume_res.to(device)
+                    hr_affine = torch.diag(
+                        torch.tensor([vol_res[0], vol_res[1], vol_res[2], 1.0], device=device)
+                    )
+                    lr_native_shape = tuple(img.shape[1:])
 
-            # Build interpolation mask: 1 = interpolated slice, 0 = acquired slice
-            if factor > 1.1:
-                interp_mask = torch.ones(1, *img.shape[1:], device=device)
-                upsampled_size = img.shape[spatial_axis]
-                acquired_indices = sorted(set(
-                    min(round(i * upsampled_size / new_size), upsampled_size - 1)
-                    for i in range(new_size)
-                ))
-                acquired_indices = torch.tensor(acquired_indices, device=device)
-                if downsample_axis == 0:
-                    interp_mask[:, acquired_indices, :, :] = 0
-                elif downsample_axis == 1:
-                    interp_mask[:, :, acquired_indices, :] = 0
+                    # Sample rotation angles
+                    rotation_angles = None
+                    if (
+                        self.obliqueness_range > 0
+                        and torch.rand(1).item() < self.prob_obliqueness
+                    ):
+                        max_rad = self.obliqueness_range * math.pi / 180.0
+                        rx = torch.empty(1, device=device).uniform_(-max_rad, max_rad).item()
+                        ry = torch.empty(1, device=device).uniform_(-max_rad, max_rad).item()
+                        rz = torch.empty(1, device=device).uniform_(-max_rad, max_rad).item()
+                        rotation_angles = (rx, ry, rz)
+
+                    # Build aligned LR affine
+                    lr_affine_aligned = build_lr_affine(
+                        hr_affine=hr_affine,
+                        through_plane_axis=downsample_axis,
+                        lr_spacing_tp=acq_res[downsample_axis].item(),
+                        hr_spacing_tp=vol_res[downsample_axis].item(),
+                        lr_shape=lr_native_shape,
+                        hr_shape=tuple(target_shape),
+                    )
+
+                    if rotation_angles is not None:
+                        # Build oblique LR affine
+                        lr_affine_oblique = build_lr_affine(
+                            hr_affine=hr_affine,
+                            through_plane_axis=downsample_axis,
+                            lr_spacing_tp=acq_res[downsample_axis].item(),
+                            hr_spacing_tp=vol_res[downsample_axis].item(),
+                            lr_shape=lr_native_shape,
+                            hr_shape=tuple(target_shape),
+                            rotation_angles=rotation_angles,
+                        )
+
+                        # Transform aligned LR -> oblique scanner space
+                        oblique_lr = affine_resample_3d(
+                            img, lr_affine_aligned, lr_affine_oblique,
+                            lr_native_shape, mode="bilinear",
+                        )
+
+                        # Capture true LR if requested
+                        if return_intermediate:
+                            true_lr_img = oblique_lr.clone()
+
+                        # Register oblique LR -> HR grid (FOV mask captures obliqueness only)
+                        img, fov_mask = resample_with_fov_mask(
+                            oblique_lr, lr_affine_oblique, hr_affine,
+                            tuple(target_shape), mode="bilinear",
+                        )
+                    else:
+                        # No rotation — direct axis-aligned resampling
+                        if return_intermediate:
+                            true_lr_img = img.clone()
+
+                        img, fov_mask = resample_with_fov_mask(
+                            img, lr_affine_aligned, hr_affine,
+                            tuple(target_shape), mode="bilinear",
+                        )
                 else:
-                    interp_mask[:, :, :, acquired_indices] = 0
+                    # --- Existing F.interpolate path ---
+                    # Capture true LR if requested (before upsample)
+                    if return_intermediate:
+                        true_lr_img = img.clone()
+
+                    # Upsample image if target_shape is specified and differs
+                    if list(img.shape[1:]) != list(target_shape):
+                        img = torch.nn.functional.interpolate(
+                            img.unsqueeze(0),
+                            size=target_shape,
+                            mode=self.upsample_mode,
+                        ).squeeze(0)
+
+                    # No obliqueness — FOV mask is all zeros (nothing missing)
+                    fov_mask = torch.zeros(1, *img.shape[1:], device=device)
+
             else:
-                interp_mask = torch.zeros(1, *img.shape[1:], device=device)
-            interp_mask_outputs.append(interp_mask.unsqueeze(0))
+                fov_mask = torch.zeros(1, *img.shape[1:], device=device)
+            fov_mask_outputs.append(fov_mask.unsqueeze(0))
 
             # Store true LR output if capturing intermediates
             if return_intermediate:
@@ -819,243 +1152,13 @@ class MRIArtifactSimulator(torch.nn.Module):
             outputs.append(img.unsqueeze(0))
 
         final_output = torch.cat(outputs, dim=0)
-        interp_masks = torch.cat(interp_mask_outputs, dim=0)
+        fov_masks = torch.cat(fov_mask_outputs, dim=0)
 
         if return_intermediate:
             true_lr_output = torch.cat(true_lr_outputs, dim=0)
-            return final_output, true_lr_output, interp_masks
+            return final_output, true_lr_output, fov_masks
         else:
-            return final_output, interp_masks
-
-
-class FOVSliceDrop(nn.Module):
-    """
-    Simulates incomplete FOV by dropping slices from the through-plane axis.
-    
-    This correctly mimics real clinical scenarios where:
-    - Axial stacks may miss top (vertex) or bottom (skull base) slices
-    - Coronal stacks may miss anterior or posterior slices
-    - Sagittal stacks may miss lateral slices
-    
-    IMPORTANT: This should be applied to the UPSAMPLED LR stacks.
-    The operation simply zeros out slices - no resizing, no interpolation,
-    no distortion to the remaining anatomy.
-    
-    Args:
-        prob: Probability of applying FOV drop to each orientation
-        min_keep_fraction: Minimum fraction of slices to keep (e.g., 0.5 = keep at least 50%)
-        max_keep_fraction: Maximum fraction to keep (e.g., 0.95 = keep at most 95%)
-    """
-    
-    def __init__(
-        self,
-        prob: float = 0.4,
-        min_keep_fraction: float = 0.5,
-        max_keep_fraction: float = 0.95,
-        force_both_sides: bool = False,
-    ):
-        super().__init__()
-        self.prob = prob
-        self.min_keep_fraction = min_keep_fraction
-        self.max_keep_fraction = max_keep_fraction
-        self.force_both_sides = force_both_sides
-        
-        # Map orientation index to through-plane axis
-        # Axial (0) → W axis (S direction)
-        # Coronal (1) → H axis (A direction)
-        # Sagittal (2) → D axis (R direction)
-        self.orientation_to_axis = {0: 4, 1: 3, 2: 2}  # In (B, C, D, H, W) format
-    
-    def forward(
-        self,
-        image: torch.Tensor,
-        orientation_idx: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Apply FOV slice dropping.
-        
-        Args:
-            image: Input volume (B, C, D, H, W) - the upsampled LR stack
-            orientation_idx: 0=Axial, 1=Coronal, 2=Sagittal
-        
-        Returns:
-            cropped_image: Image with some slices zeroed out (same shape as input)
-            spatial_mask: Binary mask (B, 1, D, H, W) indicating valid slices (1=valid, 0=dropped)
-        """
-        B, C, D, H, W = image.shape
-        device = image.device
-        
-        # Initialize output and mask
-        output = image.clone()
-        spatial_mask = torch.ones(B, 1, D, H, W, device=device)
-        
-        # Get the through-plane axis for this orientation
-        axis = self.orientation_to_axis[orientation_idx]
-        axis_size = image.shape[axis]
-        
-        for b in range(B):
-            # Decide whether to apply cropping to this sample
-            if torch.rand(1).item() > self.prob:
-                continue
-            
-            # Sample how many slices to keep
-            keep_fraction = (
-                torch.rand(1).item() * (self.max_keep_fraction - self.min_keep_fraction) 
-                + self.min_keep_fraction
-            )
-            n_keep = max(1, int(axis_size * keep_fraction))
-            n_drop = axis_size - n_keep
-            
-            if n_drop == 0:
-                continue
-            
-            # Decide which end to drop from (or both)
-            if self.force_both_sides:
-                drop_mode = 2  # Always both sides
-            else:
-                drop_mode = torch.randint(0, 3, (1,)).item()  # 0=start, 1=end, 2=both
-            
-            if drop_mode == 0:
-                # Drop from start (e.g., bottom of head for axial)
-                drop_start, drop_end = 0, n_drop
-            elif drop_mode == 1:
-                # Drop from end (e.g., top of head for axial)
-                drop_start, drop_end = axis_size - n_drop, axis_size
-            else:
-                # Drop from both ends
-                drop_each = n_drop // 2
-                drop_start_left, drop_end_left = 0, drop_each
-                drop_start_right = axis_size - (n_drop - drop_each)
-                drop_end_right = axis_size
-            
-            # Create slice objects for zeroing
-            # This is cleaner than creating full masks
-            if axis == 2:  # D axis
-                if drop_mode == 2:
-                    output[b, :, :drop_each, :, :] = 0
-                    output[b, :, drop_start_right:, :, :] = 0
-                    spatial_mask[b, :, :drop_each, :, :] = 0
-                    spatial_mask[b, :, drop_start_right:, :, :] = 0
-                else:
-                    output[b, :, drop_start:drop_end, :, :] = 0
-                    spatial_mask[b, :, drop_start:drop_end, :, :] = 0
-                    
-            elif axis == 3:  # H axis
-                if drop_mode == 2:
-                    output[b, :, :, :drop_each, :] = 0
-                    output[b, :, :, drop_start_right:, :] = 0
-                    spatial_mask[b, :, :, :drop_each, :] = 0
-                    spatial_mask[b, :, :, drop_start_right:, :] = 0
-                else:
-                    output[b, :, :, drop_start:drop_end, :] = 0
-                    spatial_mask[b, :, :, drop_start:drop_end, :] = 0
-                    
-            elif axis == 4:  # W axis
-                if drop_mode == 2:
-                    output[b, :, :, :, :drop_each] = 0
-                    output[b, :, :, :, drop_start_right:] = 0
-                    spatial_mask[b, :, :, :, :drop_each] = 0
-                    spatial_mask[b, :, :, :, drop_start_right:] = 0
-                else:
-                    output[b, :, :, :, drop_start:drop_end] = 0
-                    spatial_mask[b, :, :, :, drop_start:drop_end] = 0
-        
-        return output, spatial_mask
-
-
-class MultiOrientationFOVDrop(nn.Module):
-    """
-    Applies FOV slice dropping to multiple orientation stacks.
-    
-    Ensures that not ALL orientations lose the same region - this would
-    make reconstruction impossible. At least one orientation should
-    cover each anatomical region.
-    
-    Args:
-        prob_per_orientation: Probability of dropping slices for each orientation
-        min_keep_fraction: Minimum fraction of slices to keep
-        max_keep_fraction: Maximum fraction of slices to keep
-        ensure_coverage: If True, ensures complementary coverage (at least one
-                        orientation covers each region)
-    """
-    
-    def __init__(
-        self,
-        prob_per_orientation: float = 0.4,
-        min_keep_fraction: float = 0.5,
-        max_keep_fraction: float = 0.95,
-        ensure_coverage: bool = True,
-        force_both_sides: bool = False,
-    ):
-        super().__init__()
-        self.prob = prob_per_orientation
-        self.min_keep = min_keep_fraction
-        self.max_keep = max_keep_fraction
-        self.ensure_coverage = ensure_coverage
-        self.force_both_sides = force_both_sides
-        
-        self.dropper = FOVSliceDrop(
-            prob=1.0,  # We control probability at this level
-            min_keep_fraction=min_keep_fraction,
-            max_keep_fraction=max_keep_fraction,
-            force_both_sides=force_both_sides
-        )
-    
-    def forward(
-        self,
-        lr_stacks: List[torch.Tensor],
-    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        """
-        Apply FOV dropping to a list of orientation stacks.
-        
-        Args:
-            lr_stacks: List of 3 tensors [axial, coronal, sagittal], each (B, C, D, H, W)
-        
-        Returns:
-            dropped_stacks: List of 3 tensors with FOV dropping applied
-            spatial_masks: List of 3 mask tensors (B, 1, D, H, W)
-        """
-        B = lr_stacks[0].shape[0]
-        device = lr_stacks[0].device
-        
-        dropped_stacks = []
-        spatial_masks = []
-        
-        # Decide which orientations to drop FOR EACH BATCH ELEMENT
-        for b in range(B):
-            # Sample which orientations get dropped for this sample
-            drop_decisions = [torch.rand(1).item() < self.prob for _ in range(3)]
-            
-            # If ensure_coverage and all would be dropped, keep one
-            if self.ensure_coverage and all(drop_decisions):
-                # Keep one random orientation fully intact
-                keep_idx = torch.randint(0, 3, (1,)).item()
-                drop_decisions[keep_idx] = False
-        
-            # Store decisions for this batch element
-            if b == 0:
-                batch_drop_decisions = [drop_decisions]
-            else:
-                batch_drop_decisions.append(drop_decisions)
-        
-        # Apply dropping per orientation
-        for orient_idx in range(3):
-            stack = lr_stacks[orient_idx].clone()
-            B, C, D, H, W = stack.shape
-            mask = torch.ones(B, 1, D, H, W, device=device)
-            
-            for b in range(B):
-                if batch_drop_decisions[b][orient_idx]:
-                    # Apply dropping to this sample
-                    single_stack = stack[b:b+1]
-                    dropped, single_mask = self.dropper(single_stack, orient_idx)
-                    stack[b:b+1] = dropped
-                    mask[b:b+1] = single_mask
-            
-            dropped_stacks.append(stack)
-            spatial_masks.append(mask)
-        
-        return dropped_stacks, spatial_masks
+            return final_output, fov_masks
 
 
 class HRLRDataGenerator:
@@ -1114,6 +1217,10 @@ class HRLRDataGenerator:
         return_intermediate: bool = True,
         # Motion
         motion_intensity: float = 0.5,
+        # Obliqueness
+        enable_obliqueness: bool = False,
+        prob_obliqueness: float = 0.5,
+        obliqueness_range: float = 15.0,
     ):
         self.atlas_res = atlas_res
         self.target_res = target_res
@@ -1179,6 +1286,9 @@ class HRLRDataGenerator:
             motion_intensity=motion_intensity,
             upsample_mode=upsample_mode,
             preserve_input_shape=preserve_input_shape,
+            enable_obliqueness=enable_obliqueness,
+            prob_obliqueness=prob_obliqueness,
+            obliqueness_range=obliqueness_range,
         )
 
         # Normalization helper
@@ -1187,15 +1297,10 @@ class HRLRDataGenerator:
             lower=0.5, upper=99.5, b_min=0.0, b_max=1.0, clip=True
         )
 
-        # FOV augmentation (cached to avoid per-call object creation)
-        if fov_augmentation_prob > 0:
-            self.fov_augmenter = MultiOrientationFOVDrop(
-                prob_per_orientation=fov_augmentation_prob,
-                min_keep_fraction=0.40,
-                max_keep_fraction=0.70,
-                ensure_coverage=True,
-                force_both_sides=True,
-            )
+        # FOV drop config (applied inside the simulator at native LR resolution)
+        self.fov_min_keep = 0.40
+        self.fov_max_keep = 0.70
+        self.fov_force_both_sides = True
 
     def _normalize_image(self, image: torch.Tensor) -> torch.Tensor:
         """Normalize image to [0, 1] range using percentile scaling."""
@@ -1246,6 +1351,58 @@ class HRLRDataGenerator:
                         mask[b, indices] = True
 
         return mask
+
+    def _compute_fov_drop_decisions(
+        self, batch_size: int, device: torch.device
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """Pre-compute per-stack FOV drop decisions with coverage guarantee.
+
+        Returns:
+            Tuple of (drop_decisions, keep_fractions), each a list of
+            3 tensors of shape (batch_size,).
+        """
+        per_batch_decisions = []
+        per_batch_fractions = []
+
+        for b in range(batch_size):
+            decisions = [
+                torch.rand(1).item() < self.fov_augmentation_prob
+                for _ in range(3)
+            ]
+            # Coverage guarantee: if all would drop, keep one
+            if all(decisions):
+                keep_idx = torch.randint(0, 3, (1,)).item()
+                decisions[keep_idx] = False
+
+            fractions = []
+            for d in decisions:
+                if d:
+                    frac = (
+                        torch.rand(1).item()
+                        * (self.fov_max_keep - self.fov_min_keep)
+                        + self.fov_min_keep
+                    )
+                else:
+                    frac = 1.0
+                fractions.append(frac)
+
+            per_batch_decisions.append(decisions)
+            per_batch_fractions.append(fractions)
+
+        # Transpose: per-batch lists → per-stack tensors
+        drop_decisions = []
+        keep_fractions = []
+        for s in range(3):
+            drop_decisions.append(
+                torch.tensor([per_batch_decisions[b][s] for b in range(batch_size)],
+                             dtype=torch.bool, device=device)
+            )
+            keep_fractions.append(
+                torch.tensor([per_batch_fractions[b][s] for b in range(batch_size)],
+                             dtype=torch.float32, device=device)
+            )
+
+        return drop_decisions, keep_fractions
 
     def _create_orthogonal_resolutions(
         self,
@@ -1445,15 +1602,19 @@ class HRLRDataGenerator:
             for b in range(batch_size):
                 hr_degraded[b:b+1] = self.intensity_aug(hr_degraded[b:b+1])
 
+        # Pre-compute FOV drop decisions with coverage guarantee
+        fov_drop_decisions, fov_keep_fractions = self._compute_fov_drop_decisions(
+            batch_size, device
+        )
+
         lr_stacks = []
         true_lr_stacks = []
-        interp_masks = []
+        fov_masks = []
 
         for stack_idx in range(3):
             lr_images = hr_degraded.clone()
 
-            # C. Physics Simulation (PSF, downsampling, noise, motion, aliasing)
-            # Pass pre-sampled decisions to ensure consistency
+            # C. Physics Simulation (PSF, downsampling, noise, motion, aliasing, FOV drop)
             resolution = resolutions[stack_idx]
             thickness = thicknesses[stack_idx]
 
@@ -1468,15 +1629,17 @@ class HRLRDataGenerator:
                 motion_axis=motion_axis,
                 aliasing_axis=aliasing_axis,
                 return_intermediate=return_intermediate,
+                fov_drop_decision=fov_drop_decisions[stack_idx],
+                fov_keep_fraction=fov_keep_fractions[stack_idx],
+                fov_force_both_sides=self.fov_force_both_sides,
             )
             if return_intermediate:
-                lr_images, true_lr_images, stack_interp_masks = result
+                lr_images, true_lr_images, stack_fov_masks = result
             else:
-                lr_images, stack_interp_masks = result
-            interp_masks.append(stack_interp_masks)
+                lr_images, stack_fov_masks = result
+            fov_masks.append(stack_fov_masks)
 
             # === STEP 5: REALISTIC LR INTENSITY NORMALIZATION ===
-            # Use HR-derived normalization stats for contrast consistency
             if self.clip_to_unit_range:
                 lr_norm = []
                 for b in range(batch_size):
@@ -1505,27 +1668,14 @@ class HRLRDataGenerator:
         hr_augmented = torch.clamp(hr_augmented, 0.0, 1.0)
 
         # === STEP 6: CREATE ORIENTATION DROPOUT MASK (if enabled) ===
-        # Create orientation mask for simulating missing views
-        # The mask indicates which orientations are "present" for each sample
-        # This mask is passed to the fusion mechanism, which handles the dropout
-        # by excluding masked-out orientations from the Product of Gaussians fusion
         orientation_mask = self._create_orientation_mask(batch_size, device)
-        
-        if self.fov_augmentation_prob > 0:
-            lr_stacks, spatial_masks = self.fov_augmenter(lr_stacks)
-        else:
-            # Full coverage masks
-            spatial_masks = [
-                torch.ones(batch_size, 1, *lr_stacks[0].shape[-3:], device=device)
-                for _ in range(3)
-        ]
 
         if return_resolution and return_intermediate:
-            return lr_stacks, true_lr_stacks, hr_augmented, resolutions, thicknesses, orientation_mask, spatial_masks, interp_masks
+            return lr_stacks, true_lr_stacks, hr_augmented, resolutions, thicknesses, orientation_mask, fov_masks
         elif return_resolution:
-            return lr_stacks, hr_augmented, resolutions, thicknesses, orientation_mask, spatial_masks, interp_masks
+            return lr_stacks, hr_augmented, resolutions, thicknesses, orientation_mask, fov_masks
         else:
-            return lr_stacks, hr_augmented, orientation_mask, spatial_masks, interp_masks
+            return lr_stacks, hr_augmented, orientation_mask, fov_masks
 
     def generate_multi_variation_data(
         self,
@@ -1555,8 +1705,7 @@ class HRLRDataGenerator:
                 all_resolutions: List[List[Tensor]] — K sets of resolutions
                 all_thicknesses: List[List[Tensor]] — K sets of thicknesses
                 all_orientation_masks: List[Tensor] — K orientation masks
-                all_spatial_masks: List[List[Tensor]] — K sets of spatial masks
-                all_interp_masks: List[List[Tensor]] — K sets of interp masks
+                all_fov_masks: List[List[Tensor]] — K sets of FOV masks
         """
         batch_size = hr_images.shape[0]
         device = hr_images.device
@@ -1575,8 +1724,7 @@ class HRLRDataGenerator:
         all_resolutions = []
         all_thicknesses = []
         all_orientation_masks = []
-        all_spatial_masks = []
-        all_interp_masks = []
+        all_fov_masks = []
 
         for _var_idx in range(num_variations):
             # === STEP 2: FRESH RESOLUTION SAMPLING ===
@@ -1592,6 +1740,11 @@ class HRLRDataGenerator:
             motion_axis = torch.randint(0, 3, (batch_size,), device=device)
             aliasing_axis = torch.randint(0, 3, (batch_size,), device=device)
 
+            # Pre-compute FOV drop decisions with coverage guarantee
+            fov_drop_decisions, fov_keep_fractions = self._compute_fov_drop_decisions(
+                batch_size, device
+            )
+
             # === STEP 4: FRESH DEGRADATION ===
             hr_degraded = hr_augmented.clone()
             for b in range(batch_size):
@@ -1603,7 +1756,7 @@ class HRLRDataGenerator:
                     hr_degraded[b:b+1] = self.intensity_aug(hr_degraded[b:b+1])
 
             lr_stacks = []
-            interp_masks = []
+            fov_masks = []
 
             for stack_idx in range(3):
                 lr_images = hr_degraded.clone()
@@ -1621,9 +1774,12 @@ class HRLRDataGenerator:
                     motion_axis=motion_axis,
                     aliasing_axis=aliasing_axis,
                     return_intermediate=False,
+                    fov_drop_decision=fov_drop_decisions[stack_idx],
+                    fov_keep_fraction=fov_keep_fractions[stack_idx],
+                    fov_force_both_sides=self.fov_force_both_sides,
                 )
-                lr_images, stack_interp_masks = result
-                interp_masks.append(stack_interp_masks)
+                lr_images, stack_fov_masks = result
+                fov_masks.append(stack_fov_masks)
 
                 if self.clip_to_unit_range:
                     lr_norm = []
@@ -1640,21 +1796,11 @@ class HRLRDataGenerator:
             # === STEP 5: ORIENTATION MASK ===
             orientation_mask = self._create_orientation_mask(batch_size, device)
 
-            # === STEP 6: FOV AUGMENTATION ===
-            if self.fov_augmentation_prob > 0:
-                lr_stacks, spatial_masks = self.fov_augmenter(lr_stacks)
-            else:
-                spatial_masks = [
-                    torch.ones(batch_size, 1, *lr_stacks[0].shape[-3:], device=device)
-                    for _ in range(3)
-                ]
-
             all_lr_stacks.append(lr_stacks)
             all_resolutions.append(resolutions)
             all_thicknesses.append(thicknesses)
             all_orientation_masks.append(orientation_mask)
-            all_spatial_masks.append(spatial_masks)
-            all_interp_masks.append(interp_masks)
+            all_fov_masks.append(fov_masks)
 
         # HR is already normalized; clip tiny float drift
         hr_augmented = torch.clamp(hr_augmented, 0.0, 1.0)
@@ -1665,8 +1811,7 @@ class HRLRDataGenerator:
             all_resolutions,
             all_thicknesses,
             all_orientation_masks,
-            all_spatial_masks,
-            all_interp_masks,
+            all_fov_masks,
         )
 
 
@@ -1767,7 +1912,7 @@ class GeneratorDataset(torch.utils.data.Dataset):
                 sample_info=sample_info,
             )
             (all_lr_stacks, hr_augmented, all_resolutions, all_thicknesses,
-             all_orientation_masks, all_spatial_masks, all_interp_masks) = result
+             all_orientation_masks, all_fov_masks) = result
 
             # Build per-variation tuples, each matching the single-variation format
             variations = []
@@ -1776,8 +1921,7 @@ class GeneratorDataset(torch.utils.data.Dataset):
                 resolutions = all_resolutions[v]
                 thicknesses = all_thicknesses[v]
                 orientation_mask = all_orientation_masks[v]
-                spatial_masks = all_spatial_masks[v]
-                interp_masks = all_interp_masks[v]
+                fov_masks_v = all_fov_masks[v]
 
                 if self.balanced_orientation_combos:
                     orientation_mask = self._orientation_combo_schedule[idx]
@@ -1787,12 +1931,11 @@ class GeneratorDataset(torch.utils.data.Dataset):
                     [res.squeeze(0) for res in resolutions],
                     [thick.squeeze(0) for thick in thicknesses],
                     orientation_mask.squeeze(0),
-                    [mask.squeeze(0) for mask in spatial_masks],
-                    [mask.squeeze(0) for mask in interp_masks],
+                    [mask.squeeze(0) for mask in fov_masks_v],
                 ))
 
             # Return: (variations_list, hr_target)
-            # Each variation: (lr_stacks, resolutions, thicknesses, orientation_mask, spatial_masks, interp_masks)
+            # Each variation: (lr_stacks, resolutions, thicknesses, orientation_mask, fov_masks)
             return (variations, hr_augmented.squeeze(0))
 
         # Single-variation mode (backward compatible)
@@ -1803,7 +1946,7 @@ class GeneratorDataset(torch.utils.data.Dataset):
         )
 
         if self.return_resolution:
-            lr_stacks, hr_augmented, resolutions, thicknesses, orientation_mask, spatial_masks, interp_masks = result
+            lr_stacks, hr_augmented, resolutions, thicknesses, orientation_mask, fov_masks_list = result
             if self.balanced_orientation_combos:
                 orientation_mask = self._orientation_combo_schedule[idx]
             return (
@@ -1812,19 +1955,17 @@ class GeneratorDataset(torch.utils.data.Dataset):
                 [res.squeeze(0) for res in resolutions],
                 [thick.squeeze(0) for thick in thicknesses],
                 orientation_mask.squeeze(0),
-                [mask.squeeze(0) for mask in spatial_masks],
-                [mask.squeeze(0) for mask in interp_masks]
+                [mask.squeeze(0) for mask in fov_masks_list],
             )
         else:
-            lr_stacks, hr_augmented, orientation_mask, spatial_masks, interp_masks = result
+            lr_stacks, hr_augmented, orientation_mask, fov_masks_list = result
             if self.balanced_orientation_combos:
                 orientation_mask = self._orientation_combo_schedule[idx]
             return (
                 [stack.squeeze(0) for stack in lr_stacks],
                 hr_augmented.squeeze(0),
                 orientation_mask.squeeze(0),
-                [mask.squeeze(0) for mask in spatial_masks],
-                [mask.squeeze(0) for mask in interp_masks]
+                [mask.squeeze(0) for mask in fov_masks_list],
             )
 
 
@@ -1833,10 +1974,10 @@ def multi_variation_collate_fn(batch):
     Custom collate for multi-variation data.
 
     Each sample is (variations_list, hr_target) where variations_list contains
-    K tuples of (lr_stacks, resolutions, thicknesses, orientation_mask, spatial_masks, interp_masks).
+    K tuples of (lr_stacks, resolutions, thicknesses, orientation_mask, fov_masks).
 
     Returns:
-        variations_data: List[K] of (lr_stacks, resolutions, thicknesses, orientation_mask, spatial_masks, interp_masks)
+        variations_data: List[K] of (lr_stacks, resolutions, thicknesses, orientation_mask, fov_masks)
             where each tensor is batched along dim 0
         hr_target: (B, C, D, H, W)
     """
@@ -1849,17 +1990,16 @@ def multi_variation_collate_fn(batch):
     for v in range(num_variations):
         # Collect variation v from all samples in the batch
         var_data = [sample[v] for sample in variations_lists]
-        # var_data[i] = (lr_stacks, resolutions, thicknesses, orientation_mask, spatial_masks, interp_masks)
+        # var_data[i] = (lr_stacks, resolutions, thicknesses, orientation_mask, fov_masks)
 
         # Stack lr_stacks: list of 3, each becomes (B, C, D, H, W)
         lr_stacks = [torch.stack([s[0][orient] for s in var_data], dim=0) for orient in range(3)]
         resolutions = [torch.stack([s[1][orient] for s in var_data], dim=0) for orient in range(3)]
         thicknesses = [torch.stack([s[2][orient] for s in var_data], dim=0) for orient in range(3)]
         orientation_mask = torch.stack([s[3] for s in var_data], dim=0)
-        spatial_masks = [torch.stack([s[4][orient] for s in var_data], dim=0) for orient in range(3)]
-        interp_masks = [torch.stack([s[5][orient] for s in var_data], dim=0) for orient in range(3)]
+        fov_masks = [torch.stack([s[4][orient] for s in var_data], dim=0) for orient in range(3)]
 
-        batched_variations.append((lr_stacks, resolutions, thicknesses, orientation_mask, spatial_masks, interp_masks))
+        batched_variations.append((lr_stacks, resolutions, thicknesses, orientation_mask, fov_masks))
 
     return batched_variations, hr_target
 

@@ -1,3 +1,29 @@
+"""MS-HVED Inference with FOV mask support.
+
+Accepts pre-computed FOV masks (from prepare4test.py) and passes them to the model's fusion mechanism.
+FOV masks tell the Product of Gaussians fusion which voxels are missing
+in each orientation stack, so it can zero out their precision contribution.
+
+Usage:
+  # Single case with FOV masks
+  python test.py --input_stacks ax.nii.gz cor.nii.gz sag.nii.gz \\
+      --fov_masks ax_fov_mask.nii.gz cor_fov_mask.nii.gz sag_fov_mask.nii.gz \\
+      --output sr_output.nii.gz --model checkpoint.pth
+
+  # Single case without FOV masks
+  python test.py --input_stacks ax.nii.gz cor.nii.gz sag.nii.gz \\
+      --output sr_output.nii.gz --model checkpoint.pth
+
+  # Folder mode (auto-discovers *_fov_mask.nii.gz next to each stack)
+  python test.py --input_stacks_root /subjects --output_root /out \\
+      --model checkpoint.pth
+
+  # Generate 5 stochastic samples from the latent space
+  python test.py --input_stacks ax.nii.gz cor.nii.gz sag.nii.gz \\
+      --output sr_output.nii.gz --model checkpoint.pth --num_samples 5
+  # Saves: sr_output_sample1.nii.gz ... sr_output_sample5.nii.gz
+"""
+
 import os
 import argparse
 import torch
@@ -15,11 +41,14 @@ from monai.transforms import (
     Spacingd,
 )
 
+import torch.nn.functional as F
+
 from src import MSHVED
 from src.utils import (
     pad_to_multiple_of_32,
     unpad_volume,
 )
+
 
 def cuda_cleanup():
     """Best-effort GPU memory cleanup between cases."""
@@ -28,98 +57,69 @@ def cuda_cleanup():
         torch.cuda.empty_cache()
     gc.collect()
 
+
 def get_resolution_from_affine(affine: np.ndarray) -> np.ndarray:
-    """
-    Extract voxel resolution [x,y,z] in mm from NIfTI affine matrix.
-
-    Args:
-        affine: 4x4 affine transformation matrix
-
-    Returns:
-        Array of [res_x, res_y, res_z] in mm
-    """
+    """Extract voxel resolution [x,y,z] in mm from NIfTI affine matrix."""
     res_x = np.linalg.norm(affine[:3, 0])
     res_y = np.linalg.norm(affine[:3, 1])
     res_z = np.linalg.norm(affine[:3, 2])
     return np.array([res_x, res_y, res_z])
 
+
 def is_anisotropic(resolution: np.ndarray, threshold: float = 0.1) -> bool:
-    """
-    Check if resolution is anisotropic (non-cubic voxels).
-
-    Args:
-        resolution: Array of [res_x, res_y, res_z] in mm
-        threshold: Maximum allowed difference (mm) to consider isotropic
-
-    Returns:
-        True if anisotropic, False if isotropic
-    """
+    """Check if resolution is anisotropic (non-cubic voxels)."""
     res_range = resolution.max() - resolution.min()
     return res_range > threshold
 
+
 def create_isotropic_affine(target_res: list, shape: tuple, original_affine: np.ndarray) -> np.ndarray:
-    """
-    Create affine matrix for isotropic space, preserving orientation from original.
-
-    Args:
-        target_res: Isotropic resolution [x,y,z] in mm
-        shape: Shape of isotropic volume (D,H,W)
-        original_affine: Original affine to preserve orientation
-
-    Returns:
-        4x4 affine matrix for isotropic space
-    """
-    # Extract rotation/orientation from original affine (normalized)
+    """Create affine matrix for isotropic space, preserving orientation from original."""
     rotation = original_affine[:3, :3]
     u = rotation[:, 0] / np.linalg.norm(rotation[:, 0])
     v = rotation[:, 1] / np.linalg.norm(rotation[:, 1])
     w = rotation[:, 2] / np.linalg.norm(rotation[:, 2])
 
-    # Create new affine with isotropic scaling
     new_affine = np.eye(4)
     new_affine[:3, 0] = u * target_res[0]
     new_affine[:3, 1] = v * target_res[1]
     new_affine[:3, 2] = w * target_res[2]
-    new_affine[:3, 3] = original_affine[:3, 3]  # Preserve translation
+    new_affine[:3, 3] = original_affine[:3, 3]
 
     return new_affine
 
+
 def load_mshved_from_checkpoint(checkpoint_path, device="cuda"):
-    """
-    Load MS-HVED model from checkpoint.
-    """
+    """Load MS-HVED model from checkpoint."""
     print(f"Loading checkpoint: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model_config = checkpoint.get('model_config', {})
 
-    # Detect architecture (default to 'uhved' for backward compatibility)
     model_architecture = model_config.get('model_architecture', 'mshved')
     print(f"Detected architecture: {model_architecture}")
     print(f"Model Configuration:")
     for key, value in model_config.items():
         print(f"  - {key}: {value}")
 
-    # Extract common parameters
-    num_orientations = model_config.get('num_orientations', 3)
-    num_scales = model_config.get('num_scales', 4)
-    reconstruct_orientations = model_config.get('reconstruct_orientations', False)
     use_prior = model_config.get('use_prior', True)
-    use_encoder_outputs_as_skip = model_config.get('use_encoder_outputs_as_skip', False)
-    decoder_upsample_mode = model_config.get('decoder_upsample_mode', 'trilinear')
-    final_activation = model_config.get('final_activation', 'sigmoid')
     share_encoder = model_config.get('share_encoder', False)
     share_decoder = model_config.get('share_decoder', False)
     in_channels = model_config.get('in_channels', 1)
     out_channels = model_config.get('out_channels', 1)
-    use_norm = model_config.get('use_norm', False)
-    global_residual = model_config.get('global_residual', True)
 
-    print(f"Model configuration:")
-    print(f"  - Architecture: {model_architecture}")
-    print(f"  - num_orientations: {num_orientations}")
-    print(f"  - num_scales: {num_scales}")
 
-    # Common creation parameters
+    num_orientations = model_config.get('num_orientations', 3)
+    num_scales = model_config.get('num_scales', 4)
+    init_filters = model_config.get('init_filters', 32)
+    blocks_down = tuple(model_config.get('blocks_down', [1, 2, 2, 4]))
+    blocks_up = tuple(model_config.get('blocks_up', [1, 1, 1]))
+    reconstruct_orientations = model_config.get('reconstruct_orientations', False)
+    decoder_upsample_mode = model_config.get('decoder_upsample_mode', 'trilinear')
+    final_activation = model_config.get('final_activation', 'sigmoid')  
+    global_residual = model_config.get('global_residual', False)
+    smooth_fov = model_config.get('smooth_fov', True)
+    fov_attenuation = model_config.get('fov_attenuation', 1.0)
+    fov_transition_width = model_config.get('fov_transition_width', 3.0)
+
     params = {
         'num_orientations': num_orientations,
         'in_channels': in_channels,
@@ -131,56 +131,37 @@ def load_mshved_from_checkpoint(checkpoint_path, device="cuda"):
         'upsample_mode': decoder_upsample_mode,
         'reconstruct_orientations': reconstruct_orientations,
         'final_activation': final_activation,
-        'use_norm': use_norm,
-        'global_residual': global_residual
+        'global_residual': global_residual,
+        'smooth_fov': smooth_fov,
+        'fov_attenuation': fov_attenuation,
+        'fov_transition_width': fov_transition_width,
     }
-
-    init_filters = model_config.get('init_filters', 32)
-    blocks_down = tuple(model_config.get('blocks_down', [1, 2, 2, 4]))
-    blocks_up = tuple(model_config.get('blocks_up', [1, 1, 1]))
-    num_groups = model_config.get('num_groups', 8)
-
-    print(f"  - init_filters: {init_filters}")
-    print(f"  - blocks_down: {blocks_down}")
-    print(f"  - blocks_up: {blocks_up}")
-    print(f"  - num_groups: {num_groups}")
-    print(f"  - global_residual: {global_residual}")
-    print(f"  - use_norm: {use_norm}")
 
     model = MSHVED(
         init_filters=init_filters,
         blocks_down=blocks_down,
         blocks_up=blocks_up,
-        num_groups=num_groups,
         **params
     )
 
-    # Remap checkpoint keys for backward compatibility
     state_dict = checkpoint['model_state_dict']
-    # Load weights
     model.load_state_dict(state_dict)
     model = model.to(device)
     model.eval()
 
-    print(f"✓ Model loaded successfully")
+    print(f"Model loaded successfully")
     return model, checkpoint
 
+
 def create_inference_transforms(target_res=[1.0, 1.0, 1.0]):
-    """
-    Create MONAI preprocessing transforms for inference.
-
-    Args:
-        target_res: Target resolution [x, y, z] in mm
-
-    Returns:
-        MONAI Compose transform
-    """
+    """Create MONAI preprocessing transforms for inference."""
     return Compose([
         LoadImaged(keys=["image"], image_only=True),
         EnsureChannelFirstd(keys=["image"]),
         Orientationd(keys=["image"], axcodes="RAS", labels=None),
         Spacingd(keys=["image"], pixdim=target_res, mode="bilinear"),
     ])
+
 
 def load_orthogonal_stacks_from_files(stack_paths, target_res=[1.0, 1.0, 1.0]):
     """
@@ -192,24 +173,16 @@ def load_orthogonal_stacks_from_files(stack_paths, target_res=[1.0, 1.0, 1.0]):
         - Stack 2 (Sagittal): High-res in W/width axis, low-res in D,H
 
     Args:
-        stack_paths: List of 3 file paths [axial, coronal, sagittal] - ORDER MATTERS!
+        stack_paths: List of 3 file paths [axial, coronal, sagittal].
                     Can contain None for missing orientations.
         target_res: Target resolution [x, y, z] in mm
 
     Returns:
         Tuple of (lr_stacks_tensors, metadata_dict)
-
-        metadata_dict contains:
-        - 'affine_original': Original affine from first stack
-        - 'affine_isotropic': Affine for isotropic resampled space
-        - 'resolution_original': Original resolution [x,y,z] in mm
-        - 'shape_isotropic': Shape after resampling (D,H,W)
-        - 'is_anisotropic': Boolean flag
     """
     print("  Loading pre-existing orthogonal LR stacks...")
-    print("  ⚠️  Order: [Axial, Coronal, Sagittal]")
+    print("  Stack order: [Axial, Coronal, Sagittal]")
 
-    # Initialize metadata dictionary
     metadata = {
         'affine_original': None,
         'affine_isotropic': None,
@@ -218,7 +191,6 @@ def load_orthogonal_stacks_from_files(stack_paths, target_res=[1.0, 1.0, 1.0]):
         'is_anisotropic': False,
     }
 
-    # BEFORE transforms: Load first valid stack to get original metadata
     for stack_path in stack_paths:
         if stack_path is not None:
             try:
@@ -228,24 +200,22 @@ def load_orthogonal_stacks_from_files(stack_paths, target_res=[1.0, 1.0, 1.0]):
                 metadata['is_anisotropic'] = is_anisotropic(metadata['resolution_original'])
 
                 if metadata['is_anisotropic']:
-                    print(f"  ⚠️  Detected anisotropic resolution: {metadata['resolution_original']} mm")
-                    print(f"      Resampling to isotropic: {target_res} mm")
+                    print(f"  Detected anisotropic resolution: {metadata['resolution_original']} mm")
+                    print(f"  Resampling to isotropic: {target_res} mm")
                 else:
-                    print(f"  ℹ️  Input resolution: {metadata['resolution_original']} mm (already isotropic)")
+                    print(f"  Input resolution: {metadata['resolution_original']} mm (already isotropic)")
             except Exception as e:
                 print(f"  Warning: Could not load metadata from {stack_path}: {e}")
-                # Fallback to default
                 metadata['affine_original'] = np.diag([target_res[0], target_res[1], target_res[2], 1.0])
                 metadata['resolution_original'] = np.array(target_res)
             break
 
-    # If no valid stacks found, use default
     if metadata['affine_original'] is None:
         metadata['affine_original'] = np.diag([target_res[0], target_res[1], target_res[2], 1.0])
         metadata['resolution_original'] = np.array(target_res)
 
     transforms = create_inference_transforms(target_res)
-    lr_stacks_tensors = [None, None, None]  # Initialize with placeholders
+    lr_stacks_tensors = [None, None, None]
     reference_shape = None
 
     orientation_mapping = [
@@ -258,96 +228,133 @@ def load_orthogonal_stacks_from_files(stack_paths, target_res=[1.0, 1.0, 1.0]):
         orientation, stack_num, description = orientation_mapping[i]
 
         if stack_path is None:
-            # Missing orientation - create dummy stack later
             print(f"    - {stack_num} ({orientation}): [MISSING - will use dummy stack]")
-            # Keep as None, will create dummy after we know the shape
             continue
 
         print(f"    - {stack_num} ({orientation}): {stack_path}")
-        print(f"      └─ {description}")
+        print(f"      {description}")
 
-        # Load and preprocess with dictionary-based transforms
         data_dict = {"image": stack_path}
         data = transforms(data_dict)
-
-        # Extract volume (dictionary-based transforms return dict)
         volume = data["image"]
 
-        # Convert to numpy if tensor
         if isinstance(volume, torch.Tensor):
             volume_np = volume.cpu().numpy()
         else:
             volume_np = np.array(volume)
 
-        # Remove channel dimension for processing (C, D, H, W) -> (D, H, W)
         if volume_np.ndim == 4 and volume_np.shape[0] == 1:
             volume_np = volume_np[0]
 
-        # Store reference shape for creating dummy stacks
         if reference_shape is None:
             reference_shape = volume_np.shape
 
-        # Normalize to [0, 1]
         volume_np = (volume_np - volume_np.min()) / (volume_np.max() - volume_np.min() + 1e-8)
-
-        # Add to list as tensor with channel dimension
         lr_stacks_tensors[i] = torch.from_numpy(volume_np).float().unsqueeze(0)
 
-    # Create dummy stacks for missing orientations
     if reference_shape is None:
         raise ValueError("No valid stacks provided - at least one stack is required!")
 
     for i, stack in enumerate(lr_stacks_tensors):
         if stack is None:
-            # Create zero-filled dummy stack with same shape as reference
             dummy = torch.zeros((1,) + reference_shape, dtype=torch.float32)
             lr_stacks_tensors[i] = dummy
             print(f"    Created dummy stack for {orientation_mapping[i][0]}: shape {dummy.shape}")
 
-    # AFTER resampling: Create isotropic affine and finalize metadata
-    metadata['shape_isotropic'] = lr_stacks_tensors[0].squeeze().shape  # (D,H,W)
+    metadata['shape_isotropic'] = lr_stacks_tensors[0].squeeze().shape
     metadata['affine_isotropic'] = create_isotropic_affine(
-        target_res,
-        metadata['shape_isotropic'],
-        metadata['affine_original']
+        target_res, metadata['shape_isotropic'], metadata['affine_original']
     )
 
     print(f"    Final stack shapes: {[s.shape for s in lr_stacks_tensors]}")
     return lr_stacks_tensors, metadata
+
+
+def load_fov_masks(fov_mask_paths, target_shape, device="cuda"):
+    """Load FOV mask NIfTI files and prepare them for the model.
+
+    Each mask is loaded, resized to match the target shape if needed,
+    and returned as a list of tensors (B, 1, D, H, W) ready for the model.
+
+    Args:
+        fov_mask_paths: List of 3 paths (can contain None for missing orientations).
+        target_shape: Expected spatial shape (D, H, W) after padding.
+        device: Torch device.
+
+    Returns:
+        List of 3 tensors, each (1, 1, D, H, W). Missing masks are all-zeros.
+    """
+    fov_masks = []
+    for i, mask_path in enumerate(fov_mask_paths):
+        label = ["Axial", "Coronal", "Sagittal"][i]
+        if mask_path is not None and os.path.exists(mask_path):
+            mask_img = nib.load(mask_path)
+            mask_np = mask_img.get_fdata(dtype=np.float32)
+
+            # Binarize (threshold at 0.5)
+            mask_np = (mask_np > 0.5).astype(np.float32)
+
+            n_missing = mask_np.sum()
+            n_total = mask_np.size
+            print(f"    {label} FOV mask: {mask_path}")
+            print(f"      {int(n_missing)}/{n_total} missing ({100 * n_missing / n_total:.1f}%)")
+
+            fov_masks.append(torch.from_numpy(mask_np).float())
+        else:
+            print(f"    {label} FOV mask: not provided (using all-zeros)")
+            fov_masks.append(None)
+
+    return fov_masks
+
+
+def _sample_output_path(base_path, sample_idx):
+    """Generate output path for a specific sample.
+
+    Given 'output/sr.nii.gz' and sample_idx=2, returns 'output/sr_sample2.nii.gz'.
+    """
+    p = Path(base_path)
+    stem = p.name.replace('.nii.gz', '').replace('.nii', '')
+    suffix = '.nii.gz' if p.name.endswith('.nii.gz') else '.nii'
+    return str(p.parent / f"{stem}_sample{sample_idx}{suffix}")
+
 
 def predict_single_volume(
     model,
     output_path,
     device="cuda",
     input_stack_paths=None,
+    fov_mask_paths=None,
     target_res=[1.0, 1.0, 1.0],
     orientation_mask=None,
     save_reconstructions=False,
     reconstruction_dir=None,
+    num_samples=1,
 ):
     """
-    Run MS-HVED inference on a single volume.
+    Run MS-HVED inference on a single volume with optional FOV masks.
 
     Args:
         model: Trained MS-HVED model
         output_path: Path to save output
         device: 'cuda' or 'cpu'
-        input_stack_paths: Optional list of 3 pre-existing stack paths [axial, coronal, sagittal]
-        orientation_mask: Optional binary mask [1/0, 1/0, 1/0] indicating which orientations are present
-
+        input_stack_paths: List of 3 pre-existing stack paths [axial, coronal, sagittal]
+        fov_mask_paths: Optional list of 3 FOV mask paths [axial, coronal, sagittal].
+                       Each mask is (D, H, W) with 1=missing, 0=valid.
+        target_res: Target resolution [x, y, z] in mm
+        orientation_mask: Optional binary mask [1/0, 1/0, 1/0]
         save_reconstructions: Whether to save reconstructed orientations
         reconstruction_dir: Directory to save reconstructed orientations
+        num_samples: Number of stochastic samples to draw from the latent space.
+                    When > 1, each sample is saved as <output>_sample{i}.nii.gz.
     """
     for i, path in enumerate(input_stack_paths):
         print(f"  {['Axial', 'Coronal', 'Sagittal'][i]}: {path}")
 
-
-    # Mode 1: Load 3 pre-existing orthogonal LR stacks WITH METADATA
+    # Load stacks
     lr_stacks, metadata = load_orthogonal_stacks_from_files(input_stack_paths, target_res)
-    # Use isotropic affine for output (matches resampled data)
     affine = metadata['affine_isotropic']
 
-    # Pad to multiple of 32 if needed
+    # Pad stacks to multiple of 32
     original_shape = lr_stacks[0].squeeze().shape
     lr_stacks_padded = []
 
@@ -355,90 +362,164 @@ def predict_single_volume(
         stack_np = stack.squeeze().cpu().numpy()
         padded, pad_before, orig_shape = pad_to_multiple_of_32(stack_np)
         lr_stacks_padded.append(
-            torch.from_numpy(padded).float().unsqueeze(0).unsqueeze(0)  # (1, 1, D, H, W)
+            torch.from_numpy(padded).float().unsqueeze(0).unsqueeze(0)
         )
 
-    # Move to device
+    padded_shape = lr_stacks_padded[0].shape[2:]  # (D_pad, H_pad, W_pad)
+
+    # Load and pad FOV masks
+    fov_masks_tensor = None
+    if fov_mask_paths is not None:
+        print("  Loading FOV masks:")
+        raw_masks = load_fov_masks(fov_mask_paths, original_shape, device)
+
+        fov_masks_padded = []
+        for i, mask in enumerate(raw_masks):
+            if mask is not None:
+                mask_np = mask.numpy()
+                # Pad mask the same way as stacks
+                mask_padded, _, _ = pad_to_multiple_of_32(mask_np)
+                fov_masks_padded.append(
+                    torch.from_numpy(mask_padded).float().unsqueeze(0).unsqueeze(0).to(device)
+                )
+            else:
+                # All-zeros mask (nothing missing)
+                fov_masks_padded.append(
+                    torch.zeros(1, 1, *padded_shape, device=device)
+                )
+        fov_masks_tensor = fov_masks_padded
+
+    # Move stacks to device
     lr_stacks_padded = [stack.to(device) for stack in lr_stacks_padded]
+
     # Create orientation mask tensor
     if orientation_mask is not None:
-        # Convert to boolean tensor
-        orientation_mask_tensor = torch.tensor(orientation_mask, dtype=torch.bool, device=device).unsqueeze(0)  # (1, 3)
+        orientation_mask_tensor = torch.tensor(
+            orientation_mask, dtype=torch.bool, device=device
+        ).unsqueeze(0)
         present_orientations = [i for i, m in enumerate(orientation_mask) if m == 1]
         print(f"  Using orientation mask: {orientation_mask}")
         print(f"  Present orientations: {[['Axial', 'Coronal', 'Sagittal'][i] for i in present_orientations]}")
     else:
-        # All orientations present
         orientation_mask_tensor = None
         print(f"  Using all 3 orientations")
 
+    if fov_masks_tensor is not None:
+        print(f"  FOV masks: enabled (precision-weighted fusion)")
+    else:
+        print(f"  FOV masks: not provided (uniform precision)")
+
+    if num_samples > 1:
+        print(f"  Generating {num_samples} stochastic samples from latent space")
+
     # Run inference
-    try: 
+    try:
         model.eval()
         with torch.no_grad():
-            print("  Running standard inference...")
-            outputs = model(lr_stacks_padded, orientation_mask=orientation_mask_tensor)
+            # Encode once — shared across all samples
+            encoder_outputs = model.encode(lr_stacks_padded, orientation_mask_tensor)
 
-            # Extract outputs
-            sr_output = outputs['sr_output']
-            orientation_outputs = outputs.get('orientation_outputs', [])
+            # Compute reference for global residual (shared across samples)
+            reference = None
+            if model.global_residual:
+                reference = model._compute_reference(lr_stacks_padded, orientation_mask_tensor)
 
-        # Convert SR output back to numpy
-        sr_output = sr_output.squeeze().cpu().numpy()  # (D, H, W)
-        print(f"  SR output shape before unpad: {sr_output.shape}")
+            for sample_idx in range(num_samples):
+                if num_samples > 1:
+                    print(f"  Sample {sample_idx + 1}/{num_samples}...")
 
-        # Unpad to original shape
-        sr_output = unpad_volume(sr_output, pad_before, orig_shape)
-        print(f"  SR output shape after unpad: {sr_output.shape}")
+                # Fuse and sample from the latent space
+                if num_samples > 1:
+                    # Enable stochastic sampling by temporarily putting the
+                    # sampler in train mode (GaussianSampler checks self.training)
+                    model.fusion.sampler.train()
+                    latent_samples, posteriors = model.fuse(
+                        encoder_outputs, orientation_mask_tensor, fov_masks_tensor,
+                        deterministic=False,
+                    )
+                    model.fusion.sampler.eval()
+                else:
+                    # Single sample: deterministic (return posterior mean)
+                    latent_samples, posteriors = model.fuse(
+                        encoder_outputs, orientation_mask_tensor, fov_masks_tensor,
+                        deterministic=True,
+                    )
 
-        # Denormalize (keep in 0-1 range, scale by original max)
-        sr_output = np.clip(sr_output, 0, 1)
+                # Decode
+                if model.reconstruct_orientations:
+                    sr_output, orientation_outputs = model.decode(latent_samples, encoder_outputs)
+                else:
+                    sr_output = model.decode(latent_samples, encoder_outputs)
+                    orientation_outputs = []
 
-        # Save SR output
-        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-        out_nii = nib.Nifti1Image(sr_output, affine)
-        nib.save(out_nii, output_path)
+                # Global residual
+                if reference is not None:
+                    if reference.shape[2:] != sr_output.shape[2:]:
+                        ref = F.interpolate(reference, size=sr_output.shape[2:], mode='trilinear', align_corners=False)
+                    else:
+                        ref = reference
+                    sr_output = torch.clamp(sr_output + ref, 0.0, 1.0)
 
-        # Log output information
-        output_res = get_resolution_from_affine(affine)
-        print(f"  ✓ SR output saved to: {output_path}")
-        print(f"    Output shape: {sr_output.shape}")
-        print(f"    Output resolution: [{output_res[0]:.2f}, {output_res[1]:.2f}, {output_res[2]:.2f}] mm")
-        print(f"    Output range: [{sr_output.min():.4f}, {sr_output.max():.4f}]")
+                    for j in range(len(orientation_outputs)):
+                        if orientation_outputs[j].shape[2:] != ref.shape[2:]:
+                            ref_resized = F.interpolate(ref, size=orientation_outputs[j].shape[2:], mode='trilinear', align_corners=False)
+                        else:
+                            ref_resized = ref
+                        orientation_outputs[j] = torch.clamp(orientation_outputs[j] + ref_resized, 0.0, 1.0)
 
-        # Save reconstructed orientations if requested
-        if save_reconstructions and len(orientation_outputs) > 0:
-            print(f"\n  Saving reconstructed orientations...")
+                # Convert SR output back to numpy
+                sr_np = sr_output.squeeze().cpu().numpy()
+                sr_np = unpad_volume(sr_np, pad_before, orig_shape)
+                sr_np = np.clip(sr_np, 0, 1)
 
-            # Determine output directory
-            if reconstruction_dir is None:
-                reconstruction_dir = os.path.dirname(output_path) or "."
-            os.makedirs(reconstruction_dir, exist_ok=True)
+                # Determine save path
+                if num_samples > 1:
+                    save_path = _sample_output_path(output_path, sample_idx + 1)
+                else:
+                    save_path = output_path
 
-            # Get base filename
-            base_name = os.path.splitext(os.path.basename(output_path))[0]
-            if base_name.endswith('.nii'):
-                base_name = base_name[:-4]  # Remove .nii from .nii.gz
+                os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+                out_nii = nib.Nifti1Image(sr_np, affine)
+                nib.save(out_nii, save_path)
 
-            orientation_names = ['axial', 'coronal', 'sagittal']
-            for i, recon in enumerate(orientation_outputs):
-                # Convert to numpy and unpad
-                recon_np = recon.squeeze().cpu().numpy()
-                recon_np = unpad_volume(recon_np, pad_before, orig_shape)
-                recon_np = np.clip(recon_np, 0, 1)
+                output_res = get_resolution_from_affine(affine)
+                print(f"  SR output saved to: {save_path}")
+                print(f"    Output shape: {sr_np.shape}")
+                print(f"    Output resolution: [{output_res[0]:.2f}, {output_res[1]:.2f}, {output_res[2]:.2f}] mm")
+                print(f"    Output range: [{sr_np.min():.4f}, {sr_np.max():.4f}]")
 
-                # Save
-                recon_path = os.path.join(reconstruction_dir, f"{base_name}_recon_{orientation_names[i]}.nii.gz")
-                recon_nii = nib.Nifti1Image(recon_np, affine)
-                nib.save(recon_nii, recon_path)
-                print(f"    - {orientation_names[i]}: {recon_path}")
-        elif save_reconstructions and len(orientation_outputs) == 0:
-            print(f"  Note: Model was not trained with orientation reconstruction, skipping...")
-    
+                # Save reconstructed orientations if requested (only for first sample)
+                if save_reconstructions and sample_idx == 0:
+                    if len(orientation_outputs) > 0:
+                        print(f"\n  Saving reconstructed orientations...")
+
+                        if reconstruction_dir is None:
+                            reconstruction_dir = os.path.dirname(output_path) or "."
+                        os.makedirs(reconstruction_dir, exist_ok=True)
+
+                        base_name = os.path.splitext(os.path.basename(output_path))[0]
+                        if base_name.endswith('.nii'):
+                            base_name = base_name[:-4]
+
+                        orientation_names = ['axial', 'coronal', 'sagittal']
+                        for j, recon in enumerate(orientation_outputs):
+                            recon_np = recon.squeeze().cpu().numpy()
+                            recon_np = unpad_volume(recon_np, pad_before, orig_shape)
+                            recon_np = np.clip(recon_np, 0, 1)
+
+                            recon_path = os.path.join(reconstruction_dir, f"{base_name}_recon_{orientation_names[j]}.nii.gz")
+                            recon_nii = nib.Nifti1Image(recon_np, affine)
+                            nib.save(recon_nii, recon_path)
+                            print(f"    - {orientation_names[j]}: {recon_path}")
+                    else:
+                        print(f"  Note: Model was not trained with orientation reconstruction, skipping...")
+
     finally:
         try:
             del lr_stacks, lr_stacks_padded
-            if 'outputs' in locals(): del outputs
+            if fov_masks_tensor is not None:
+                del fov_masks_tensor
+            if 'encoder_outputs' in locals(): del encoder_outputs
             if 'sr_output' in locals(): del sr_output
             if 'orientation_outputs' in locals(): del orientation_outputs
             if 'orientation_mask_tensor' in locals(): del orientation_mask_tensor
@@ -446,55 +527,73 @@ def predict_single_volume(
             pass
         cuda_cleanup()
 
+
 def predict_batch(
     output_paths,
     model_path,
     target_res=[1.0, 1.0, 1.0],
     device="cuda",
     input_stack_paths=None,
+    fov_mask_paths=None,
     orientation_mask=None,
     save_reconstructions=False,
     reconstruction_dir=None,
+    num_samples=1,
 ):
-    """Process multiple volumes in batch."""
+    """Process a single case."""
     print("=" * 80)
-    print("MS-HVED Inference - Orthogonal Stack Super-Resolution")
+    print("MS-HVED Inference with FOV Masks")
     print("=" * 80)
 
-    # Load model
     model, checkpoint = load_mshved_from_checkpoint(model_path, device=device)
 
     print(f"\nInference settings:")
-    print(f"  Mode: {'Pre-existing stacks' if input_stack_paths else 'Generate from HR volume'}")
     print(f"  Device: {device}")
     print(f"  Target resolution: {target_res} mm")
+    print(f"  FOV masks: {'provided' if fov_mask_paths else 'not provided'}")
+    if num_samples > 1:
+        print(f"  Latent samples: {num_samples}")
 
-    if input_stack_paths:
-        print(f"\nProcessing 1 set of stacks...\n")
+    print(f"\nProcessing 1 set of stacks...\n")
 
-    # Process volume(s)
-    if input_stack_paths:
-        # Single case: process one set of 3 stacks
-        print(f"[1/1]")
-        try:
-            predict_single_volume(
-                model=model,
-                output_path=output_paths[0] if isinstance(output_paths, list) else output_paths,
-                target_res=target_res,
-                device=device,
-                input_stack_paths=input_stack_paths,
-                orientation_mask=orientation_mask,
-                save_reconstructions=save_reconstructions,
-                reconstruction_dir=reconstruction_dir,
-            )
-        except Exception as e:
-            print(f"  ✗ ERROR: {str(e)}")
-            import traceback
-            traceback.print_exc()
+    try:
+        predict_single_volume(
+            model=model,
+            output_path=output_paths[0] if isinstance(output_paths, list) else output_paths,
+            target_res=target_res,
+            device=device,
+            input_stack_paths=input_stack_paths,
+            fov_mask_paths=fov_mask_paths,
+            orientation_mask=orientation_mask,
+            save_reconstructions=save_reconstructions,
+            reconstruction_dir=reconstruction_dir,
+            num_samples=num_samples,
+        )
+    except Exception as e:
+        print(f"  ERROR: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
     print("\n" + "=" * 80)
     print("Inference complete!")
     print("=" * 80)
+
+
+def _find_fov_mask(stack_path):
+    """Try to find a FOV mask file next to a stack file.
+
+    Looks for <stem>_fov_mask.nii.gz in the same directory.
+    Returns the path if found, None otherwise.
+    """
+    if stack_path is None:
+        return None
+    p = Path(stack_path)
+    stem = p.name.replace('.nii.gz', '').replace('.nii', '')
+    candidate = p.parent / f"{stem}_fov_mask.nii.gz"
+    if candidate.exists():
+        return str(candidate)
+    return None
+
 
 def predict_folder(
     input_stacks_root: str,
@@ -506,23 +605,26 @@ def predict_folder(
     pattern_ax="axial_upsampled.nii.gz",
     pattern_cor="coronal_upsampled.nii.gz",
     pattern_sag="sagittal_upsampled.nii.gz",
+    pattern_fov_ax=None,
+    pattern_fov_cor=None,
+    pattern_fov_sag=None,
     output_name="mshved_prediction.nii.gz",
     skip_existing=False,
     fail_fast=False,
     save_reconstructions=False,
     reconstruction_dir=None,
+    num_samples=1,
 ):
     """
     Batch inference over a directory of subject folders.
 
     Each subject folder is expected to contain:
-      - axial_upsampled.nii.gz
-      - coronal_upsampled.nii.gz
-      - sagittal_upsampled.nii.gz
+      - axial_upsampled.nii.gz (+ optional axial_upsampled_fov_mask.nii.gz)
+      - coronal_upsampled.nii.gz (+ optional coronal_upsampled_fov_mask.nii.gz)
+      - sagittal_upsampled.nii.gz (+ optional sagittal_upsampled_fov_mask.nii.gz)
 
-    orientation_mask controls which orientations are USED, even if files exist.
-    Missing masked-in files -> skip subject (or fail_fast).
-    Masked-out orientations are ignored (passed as None to the loader).
+    FOV masks are auto-discovered: for each stack <stem>.nii.gz, the script
+    looks for <stem>_fov_mask.nii.gz in the same directory.
     """
     stacks_root = Path(input_stacks_root)
     if not stacks_root.exists() or not stacks_root.is_dir():
@@ -531,30 +633,24 @@ def predict_folder(
     out_root = Path(output_root) if output_root else stacks_root
     out_root.mkdir(parents=True, exist_ok=True)
 
-    # Default: use all 3
     if orientation_mask is None:
         orientation_mask = [1, 1, 1]
 
-    # Load model
     model, checkpoint = load_mshved_from_checkpoint(model_path, device=device)
 
     subject_dirs = sorted([p for p in stacks_root.iterdir() if p.is_dir()])
     print(f"\nFound {len(subject_dirs)} subject folders in: {stacks_root}\n")
 
-    for i, subj_dir in enumerate(tqdm(subject_dirs, desc="Generating LR stacks"), start=1):
+    for i, subj_dir in enumerate(tqdm(subject_dirs, desc="Processing subjects"), start=1):
         subj_id = subj_dir.name
 
         ax = subj_dir / pattern_ax
         cor = subj_dir / pattern_cor
         sag = subj_dir / pattern_sag
 
-        # Build input_stack_paths with None placeholders to match your existing loader
-        # Index mapping: [Axial, Coronal, Sagittal]
         stack_paths = [None, None, None]
         file_candidates = [ax, cor, sag]
 
-        # Enforce mask: if mask=0, pass None even if file exists
-        # If mask=1, require file exists
         missing_required = []
         for idx, (m, p) in enumerate(zip(orientation_mask, file_candidates)):
             if m == 1:
@@ -565,7 +661,6 @@ def predict_folder(
             else:
                 stack_paths[idx] = None
 
-        # Decide output path
         out_path = out_root / subj_id / output_name if output_root else subj_dir / output_name
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -580,20 +675,35 @@ def predict_folder(
             print(msg)
             continue
 
-        print(f"\n[{i}/{len(subject_dirs)}] {subj_id}")
+        # Discover FOV masks: use explicit patterns if provided, else auto-discover
+        fov_patterns = [pattern_fov_ax, pattern_fov_cor, pattern_fov_sag]
+        fov_mask_paths = []
+        for sp, fov_pat in zip(stack_paths, fov_patterns):
+            if fov_pat is not None and sp is not None:
+                candidate = subj_dir / fov_pat
+                fov_mask_paths.append(str(candidate) if candidate.exists() else None)
+            else:
+                fov_mask_paths.append(_find_fov_mask(sp))
+        has_any_mask = any(p is not None for p in fov_mask_paths)
+
+        print(f"\n[{i}/{len(subject_dirs)}] {subj_id}"
+              f" {'(with FOV masks)' if has_any_mask else '(no FOV masks)'}")
+
         try:
             predict_single_volume(
                 model=model,
                 output_path=str(out_path),
                 device=device,
                 input_stack_paths=stack_paths,
+                fov_mask_paths=fov_mask_paths if has_any_mask else None,
                 target_res=target_res,
                 orientation_mask=orientation_mask,
                 save_reconstructions=save_reconstructions,
                 reconstruction_dir=reconstruction_dir,
+                num_samples=num_samples,
             )
         except Exception as e:
-            print(f"  ✗ ERROR on {subj_id}: {e}")
+            print(f"  ERROR on {subj_id}: {e}")
             import traceback
             traceback.print_exc()
             if fail_fast:
@@ -601,61 +711,146 @@ def predict_folder(
 
     print("\nAll subjects done.")
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="MS-HVED Inference with Orthogonal Stacks")
 
-    # Input/output arguments
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="MS-HVED Inference with FOV Mask Support",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Single case with FOV masks
+  python test.py --input_stacks ax.nii.gz cor.nii.gz sag.nii.gz \\
+      --fov_masks ax_fov_mask.nii.gz cor_fov_mask.nii.gz sag_fov_mask.nii.gz \\
+      --output sr.nii.gz --model checkpoint.pth
+
+  # Single case without FOV masks (same as original test.py)
+  python test.py --input_stacks ax.nii.gz cor.nii.gz sag.nii.gz \\
+      --output sr.nii.gz --model checkpoint.pth
+
+  # Folder mode (auto-discovers *_fov_mask.nii.gz next to each stack)
+  python test.py --input_stacks_root /subjects --output_root /out \\
+      --model checkpoint.pth
+
+  # With missing orientations
+  python test.py --input_stacks ax.nii.gz cor.nii.gz \\
+      --fov_masks ax_fov_mask.nii.gz cor_fov_mask.nii.gz \\
+      --orientation_mask 1 1 0 --output sr.nii.gz --model checkpoint.pth
+        """
+    )
+
+    # Input/output
     parser.add_argument("--input_stacks", type=str, nargs='+', default=None,
-                       help="Orthogonal LR stack files (1-3 stacks). Provide in order: axial, coronal, sagittal. "
-                            "If fewer than 3 stacks, you MUST also specify --orientation_mask to indicate which orientations are present. "
-                            "Example: For axial+coronal only, use '--input_stacks axial.nii.gz coronal.nii.gz --orientation_mask 1 1 0'")
+                       help="Orthogonal LR stack files (1-3 stacks) in order: axial, coronal, sagittal. "
+                            "If fewer than 3 stacks, you MUST also specify --orientation_mask.")
+    parser.add_argument("--fov_masks", type=str, nargs='+', default=None,
+                       help="FOV mask NIfTI files matching the input stacks (same order). "
+                            "1=missing, 0=valid. Generated by prepare4test.py.")
     parser.add_argument("--output", type=str, required=False,
                        help="Output image file or directory")
 
-    # Model arguments
+    # Model
     parser.add_argument("--model", type=str, required=True,
                        help="Path to trained model checkpoint (.pth file)")
 
-    # Preprocessing arguments
+    # Preprocessing
     parser.add_argument("--target_res", type=float, nargs=3, default=[1.0, 1.0, 1.0],
                        help="Target resolution in mm (e.g., 1.0 1.0 1.0)")
 
-    # Inference arguments
+    # Inference
     parser.add_argument("--device", type=str, default="cuda",
                        help="Device: cuda or cpu")
 
-    # Orientation handling arguments
+    # Orientation handling
     parser.add_argument("--orientation_mask", type=int, nargs=3, default=None,
-                       help="Binary mask indicating which orientations are present (e.g., 1 1 0 for axial+coronal only). "
-                            "Use this to handle missing modalities. Default: all present (1 1 1)")
+                       help="Binary mask indicating which orientations are present (e.g., 1 1 0)")
     parser.add_argument("--save_reconstructions", action="store_true",
-                       help="Save reconstructed orientation outputs (if model was trained with orientation reconstruction)")
+                       help="Save reconstructed orientation outputs")
     parser.add_argument("--reconstruction_dir", type=str, default=None,
-                       help="Directory to save reconstructed orientations (default: same as output directory)")
+                       help="Directory to save reconstructed orientations")
 
+    # Folder mode
     parser.add_argument("--input_stacks_root", type=str, default=None,
                     help="Root dir containing subject subfolders of orthogonal stacks.")
     parser.add_argument("--output_root", type=str, default=None,
-                        help="Where to save outputs for folder mode. If omitted, saves into each subject folder.")
+                        help="Where to save outputs for folder mode.")
     parser.add_argument("--pattern_ax", type=str, default="axial_upsampled.nii.gz")
     parser.add_argument("--pattern_cor", type=str, default="coronal_upsampled.nii.gz")
     parser.add_argument("--pattern_sag", type=str, default="sagittal_upsampled.nii.gz")
+    parser.add_argument("--pattern_fov_ax", type=str, default=None,
+                        help="FOV mask filename for axial stack. Default: auto-discover via <stack_stem>_fov_mask.nii.gz")
+    parser.add_argument("--pattern_fov_cor", type=str, default=None,
+                        help="FOV mask filename for coronal stack. Default: auto-discover via <stack_stem>_fov_mask.nii.gz")
+    parser.add_argument("--pattern_fov_sag", type=str, default=None,
+                        help="FOV mask filename for sagittal stack. Default: auto-discover via <stack_stem>_fov_mask.nii.gz")
     parser.add_argument("--output_name", type=str, default="mshved_prediction.nii.gz")
     parser.add_argument("--skip_existing", action="store_true")
     parser.add_argument("--fail_fast", action="store_true")
 
+    # Multi-sample inference
+    parser.add_argument("--num_samples", type=int, default=1,
+                       help="Number of stochastic samples to draw from the latent space. "
+                            "Each sample produces a separate output file (<name>_sample{i}.nii.gz). "
+                            "Default: 1 (deterministic, returns posterior mean).")
+
+    # FOV fusion overrides (override checkpoint values at inference time)
+    parser.add_argument("--fov_attenuation", type=float, default=None,
+                       help="Override FOV precision attenuation (0=none, 1=full). Default: use checkpoint value.")
+    parser.add_argument("--no_smooth_fov", action="store_true",
+                       help="Disable FOV mask smoothing (use hard binary boundaries)")
+    parser.add_argument("--fov_transition_width", type=float, default=None,
+                       help="Override FOV smoothing sigma in voxels. Default: use checkpoint value.")
+
+    # Global residual override (overrides checkpoint value at inference time)
+    parser.add_argument("--global_residual", action="store_true",
+                       help="Force-enable global residual at inference (overrides checkpoint). "
+                            "Adds the reference (mean of input stacks) to the decoder output and clamps to [0,1].")
+    parser.add_argument("--no_global_residual", action="store_true",
+                       help="Force-disable global residual at inference (overrides checkpoint). "
+                            "Note: if the checkpoint was trained with global_residual=True, the decoder's "
+                            "final activation is 'none', so disabling residual may produce unbounded outputs.")
+
     args = parser.parse_args()
 
-    # Check device
     if args.device == "cuda" and not torch.cuda.is_available():
         print("CUDA not available, falling back to CPU")
         args.device = "cpu"
 
-    # -------------------------------
-    # Mode 0: Folder mode (batch over subject directories)
-    # -------------------------------
+    if args.global_residual and args.no_global_residual:
+        raise ValueError("--global_residual and --no_global_residual are mutually exclusive.")
+
+    # Store FOV overrides for post-load application
+    _fov_overrides = {}
+    if args.no_smooth_fov:
+        _fov_overrides['smooth_fov'] = False
+    if args.fov_attenuation is not None:
+        _fov_overrides['fov_attenuation'] = args.fov_attenuation
+    if args.fov_transition_width is not None:
+        _fov_overrides['fov_transition_width'] = args.fov_transition_width
+
+    # Resolve global_residual override (None = use checkpoint value)
+    _global_residual_override = None
+    if args.no_global_residual:
+        _global_residual_override = False
+    elif args.global_residual:
+        _global_residual_override = True
+
+    # Monkey-patch load function to apply overrides
+    _orig_load = load_mshved_from_checkpoint
+    def _load_with_overrides(checkpoint_path, device="cuda"):
+        model, checkpoint = _orig_load(checkpoint_path, device)
+        if _fov_overrides:
+            fusion_module = model.fusion.fusion  # MultiScaleFusion -> ProductOfGaussians
+            for k, v in _fov_overrides.items():
+                setattr(fusion_module, k, v)
+            print(f"  FOV fusion overrides applied: {_fov_overrides}")
+        if _global_residual_override is not None:
+            model.global_residual = _global_residual_override
+            print(f"  global_residual override: {'enabled' if _global_residual_override else 'disabled'}")
+        return model, checkpoint
+    load_mshved_from_checkpoint = _load_with_overrides
+
+    # ---- Mode 0: Folder mode ----
     if getattr(args, "input_stacks_root", None):
-        # Default mask = use all orientations
         if args.orientation_mask is None:
             args.orientation_mask = [1, 1, 1]
 
@@ -669,28 +864,29 @@ if __name__ == "__main__":
             pattern_ax=getattr(args, "pattern_ax", "axial_upsampled.nii.gz"),
             pattern_cor=getattr(args, "pattern_cor", "coronal_upsampled.nii.gz"),
             pattern_sag=getattr(args, "pattern_sag", "sagittal_upsampled.nii.gz"),
+            pattern_fov_ax=getattr(args, "pattern_fov_ax", None),
+            pattern_fov_cor=getattr(args, "pattern_fov_cor", None),
+            pattern_fov_sag=getattr(args, "pattern_fov_sag", None),
             output_name=getattr(args, "output_name", "mshved_prediction.nii.gz"),
             skip_existing=getattr(args, "skip_existing", False),
             fail_fast=getattr(args, "fail_fast", False),
             save_reconstructions=args.save_reconstructions,
             reconstruction_dir=args.reconstruction_dir,
+            num_samples=args.num_samples,
         )
         raise SystemExit(0)
 
-    # -------------------------------
-    # Mode 1: Pre-existing orthogonal stacks (single case)
-    # -------------------------------
+    # ---- Mode 1: Single case ----
     if args.input_stacks:
         num_stacks = len(args.input_stacks)
         if not (1 <= num_stacks <= 3):
             raise ValueError(f"Expected 1-3 input stacks, got {num_stacks}")
 
-        # Validate provided stack files exist
         for i, stack_path in enumerate(args.input_stacks):
             if not Path(stack_path).exists():
                 raise ValueError(f"Provided stack {i+1} not found: {stack_path}")
 
-        # Normalize / validate orientation mask
+        # Validate orientation mask
         if args.orientation_mask is None:
             if num_stacks == 3:
                 args.orientation_mask = [1, 1, 1]
@@ -702,7 +898,7 @@ if __name__ == "__main__":
                 )
         else:
             if len(args.orientation_mask) != 3:
-                raise ValueError(f"--orientation_mask must have 3 values (ax cor sag). Got: {args.orientation_mask}")
+                raise ValueError(f"--orientation_mask must have 3 values. Got: {args.orientation_mask}")
             if any(v not in (0, 1) for v in args.orientation_mask):
                 raise ValueError(f"--orientation_mask values must be 0 or 1. Got: {args.orientation_mask}")
 
@@ -711,14 +907,11 @@ if __name__ == "__main__":
             raise ValueError("orientation_mask cannot be all zeros.")
 
         # Build full [ax, cor, sag] list with None placeholders
-        # If 3 stacks provided, we assume order is [ax, cor, sag] and still allow mask to disable any.
         if num_stacks < 3:
             if num_present != num_stacks:
                 raise ValueError(
                     f"Orientation mask indicates {num_present} present orientations, "
-                    f"but {num_stacks} stacks were provided. These must match!\n"
-                    "Tip: stacks are passed in the same order as the 1s in --orientation_mask "
-                    "(axial, coronal, sagittal)."
+                    f"but {num_stacks} stacks were provided. These must match!"
                 )
 
             input_stack_paths = [None, None, None]
@@ -728,35 +921,54 @@ if __name__ == "__main__":
                     input_stack_paths[i] = args.input_stacks[stack_idx]
                     stack_idx += 1
         else:
-            input_stack_paths = list(args.input_stacks)  # [ax, cor, sag]
+            input_stack_paths = list(args.input_stacks)
             for i, present in enumerate(args.orientation_mask):
                 if present == 0:
                     input_stack_paths[i] = None
 
-        # Optional logging
+        # Build FOV mask paths (same logic: align with orientation mask)
+        fov_mask_paths = None
+        if args.fov_masks:
+            num_masks = len(args.fov_masks)
+            if num_masks != num_stacks:
+                raise ValueError(
+                    f"Number of FOV masks ({num_masks}) must match number of input stacks ({num_stacks})"
+                )
+            for mask_path in args.fov_masks:
+                if not Path(mask_path).exists():
+                    raise ValueError(f"FOV mask not found: {mask_path}")
+
+            if num_stacks < 3:
+                fov_mask_paths = [None, None, None]
+                mask_idx = 0
+                for i, present in enumerate(args.orientation_mask):
+                    if present == 1:
+                        fov_mask_paths[i] = args.fov_masks[mask_idx]
+                        mask_idx += 1
+            else:
+                fov_mask_paths = list(args.fov_masks)
+                for i, present in enumerate(args.orientation_mask):
+                    if present == 0:
+                        fov_mask_paths[i] = None
+
         names = ["Axial", "Coronal", "Sagittal"]
         used = [n for n, p in zip(names, input_stack_paths) if p is not None]
-        print(f"\n📦 Stack mode: using {len(used)}/3 orientations -> {', '.join(used)}")
+        print(f"\nStack mode: using {len(used)}/3 orientations -> {', '.join(used)}")
         print(f"   orientation_mask = {args.orientation_mask}")
+        if fov_mask_paths:
+            print(f"   FOV masks: provided")
+        else:
+            print(f"   FOV masks: not provided")
 
-        # Run inference (single case)
         predict_batch(
-            output_paths=args.output,  # if predict_batch expects list, change to [args.output]
+            output_paths=args.output,
             model_path=args.model,
             target_res=args.target_res,
             device=args.device,
             input_stack_paths=input_stack_paths,
+            fov_mask_paths=fov_mask_paths,
             orientation_mask=args.orientation_mask,
             save_reconstructions=args.save_reconstructions,
             reconstruction_dir=args.reconstruction_dir,
+            num_samples=args.num_samples,
         )
-        raise SystemExit(0)
-
-    # -------------------------------
-    # If no valid mode was chosen
-    # -------------------------------
-    raise ValueError(
-        "No valid inference mode selected. Use one of:\n"
-        "  - --input_stacks_root <dir>\n"
-        "  - --input_stacks <1-3 paths> (and possibly --orientation_mask)\n"
-    )

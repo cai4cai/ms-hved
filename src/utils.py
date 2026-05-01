@@ -330,44 +330,71 @@ def get_image_paths(
     filter_4d=True,
 ):
     """
-    Get image paths from either directory or CSV file.
+    Get image paths from either directory or one-or-more CSV files.
 
     Args:
         image_dir: Directory containing images (mutually exclusive with csv_file)
-        csv_file: CSV file with image metadata (mutually exclusive with image_dir)
-        base_dir: Base directory for relative paths in CSV (required if csv_file is provided)
+        csv_file: CSV file(s) with image metadata. Either a single path or a list
+                  of paths for multi-dataset training. Mutually exclusive with image_dir.
+        base_dir: Base directory (or list of base directories) for relative paths in CSV.
+                  If csv_file is a list, base_dir must be a list of the same length.
         split: Data split for CSV ('train', 'val', or 'test')
-        model_dir: Model directory for saving filtered images log (optional)
+        model_dir: Model directory for saving filtered images log (optional).
+                   When multiple CSVs are provided, per-CSV logs are suffixed with an index.
         mri_classifications: List of MRI classifications to include (e.g., ['T1', 'T2', 'FLAIR'])
-                           Only applicable when using csv_file
+                           Applied globally to every CSV. Only applicable when using csv_file.
         acquisition_types: List of acquisition types to include (default: ['3D'])
-                          Set to None to include all types. Only applicable when using csv_file
-        filter_4d: If True, filters out 4D images (default: True)
-                  Only applicable when using csv_file
+                          Set to None to include all types. Applied globally to every CSV.
+        filter_4d: If True, filters out 4D images (default: True). Applied globally.
 
     Returns:
-        List of image paths
+        List of image paths (concatenated across all CSVs when multiple are provided).
     """
     if csv_file is not None:
         if base_dir is None:
             raise ValueError("--base_dir is required when using --csv_file")
 
-        # Set up log path for filtered 4D images if model_dir is provided
-        log_filtered_path = None
-        if model_dir is not None and filter_4d:
-            log_filtered_path = os.path.join(
-                model_dir, f"filtered_4d_images_{split}.csv"
+        # Normalize to lists so single- and multi-dataset callers share one code path
+        csv_files = list(csv_file) if isinstance(csv_file, (list, tuple)) else [csv_file]
+        base_dirs = list(base_dir) if isinstance(base_dir, (list, tuple)) else [base_dir]
+
+        if len(csv_files) != len(base_dirs):
+            raise ValueError(
+                f"Number of CSV files ({len(csv_files)}) must match number of base "
+                f"directories ({len(base_dirs)}). Got csv_files={csv_files}, "
+                f"base_dirs={base_dirs}"
             )
 
-        return load_image_paths_from_csv(
-            csv_file,
-            base_dir,
-            split=split,
-            acquisition_types=acquisition_types,
-            mri_classifications=mri_classifications,
-            filter_4d=filter_4d,
-            log_filtered_path=log_filtered_path,
-        )
+        all_paths = []
+        for i, (csv, bd) in enumerate(zip(csv_files, base_dirs)):
+            log_filtered_path = None
+            if model_dir is not None and filter_4d:
+                suffix = f"_{i}" if len(csv_files) > 1 else ""
+                log_filtered_path = os.path.join(
+                    model_dir, f"filtered_4d_images_{split}{suffix}.csv"
+                )
+
+            if len(csv_files) > 1:
+                print(f"\n[Dataset {i + 1}/{len(csv_files)}] csv={csv}, base_dir={bd}")
+
+            paths = load_image_paths_from_csv(
+                csv,
+                bd,
+                split=split,
+                acquisition_types=acquisition_types,
+                mri_classifications=mri_classifications,
+                filter_4d=filter_4d,
+                log_filtered_path=log_filtered_path,
+            )
+            all_paths.extend(paths)
+
+        if len(csv_files) > 1:
+            print(
+                f"✓ Combined {len(all_paths)} total {split} images from "
+                f"{len(csv_files)} CSV files"
+            )
+
+        return all_paths
     elif image_dir is not None:
         # Get all .nii.gz files from directory
         image_dir = Path(image_dir)
@@ -449,10 +476,22 @@ def save_training_config(model_dir, args, n_train_samples, n_val_samples):
     """Save training configuration to JSON."""
     import json
 
+    # Normalize CSV/base_dir args to lists for consistent logging
+    csv_files = getattr(args, 'csv_file', None)
+    base_dirs = getattr(args, 'base_dir', None)
+    if csv_files is not None and not isinstance(csv_files, (list, tuple)):
+        csv_files = [csv_files]
+    if base_dirs is not None and not isinstance(base_dirs, (list, tuple)):
+        base_dirs = [base_dirs]
+
     config = {
         # Dataset info
         'n_train_samples': n_train_samples,
         'n_val_samples': n_val_samples,
+        'csv_files': list(csv_files) if csv_files is not None else None,
+        'base_dirs': [str(b) for b in base_dirs] if base_dirs is not None else None,
+        'hr_image_dir': getattr(args, 'hr_image_dir', None),
+        'val_image_dir': getattr(args, 'val_image_dir', None),
 
         # Training parameters (common to all scripts)
         'epochs': args.epochs,
@@ -511,7 +550,6 @@ def save_training_config(model_dir, args, n_train_samples, n_val_samples):
         'init_filters': getattr(args, 'init_filters', 32),
         'blocks_down': getattr(args, 'blocks_down', [1, 2, 2, 4]),
         'blocks_up': getattr(args, 'blocks_up', [1, 1, 1]),
-        'num_groups': getattr(args, 'num_groups', 8),
     }
 
     config_path = os.path.join(model_dir, 'training_config.json')

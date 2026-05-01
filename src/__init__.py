@@ -1,11 +1,8 @@
 # MS-HVED for Super-Resolution
-# PyTorch implementation of Hetero-Orientation Variational Encoder-Decoder
-# Adapted from: https://github.com/ReubenDo/U-HVED
-# Paper: https://arxiv.org/abs/1907.11150
 
 from .mshved import MSHVED, create_mshved
-from .encoder import SegResEncoder
-from .decoder import SegResDecoder
+from .encoder import Encoder
+from .decoder import Decoder
 from .fusion import ProductOfGaussians
 from .blocks import RegressionResBlock, UpsampleBlock
 
@@ -25,8 +22,8 @@ __all__ = [
     'LatentConsistencyLoss',
     'create_loss',
     'create_mshved',
-    'SegResEncoder',
-    'SegResDecoder',
+    'Encoder',
+    'Decoder',
     'MSHVED',
     'RegressionResBlock',
     'UpsampleBlock',

@@ -1,18 +1,8 @@
-# MS-HVED: Multi-Stack Super-Resolution of Brain MRI Using Hetero-Orientation Variational Encoding
+# MS-HVED++: Multi-Scale Hierarchical Variational Encoder-Decoder for Brain MRI Super-Resolution
 
-Official implementation of **MS-HVED**, a deep learning framework for isotropic super-resolution of brain MRI from multiple anisotropic orthogonal acquisitions. The model fuses axial, coronal, and sagittal low-resolution stacks via a Product-of-Gaussians posterior to produce high-resolution isotropic outputs.
+A deep learning framework for isotropic super-resolution of brain MRI from multiple anisotropic orthogonal acquisitions. MS-HVED++ fuses axial, coronal, and sagittal low-resolution stacks via a Product-of-Gaussians (PoG) posterior in a multi-scale latent space to produce high-resolution isotropic outputs.
 
-## Architecture
-
-<p align="center">
-  <img src="assets/architecture.png" width="90%" />
-</p>
-
-## Qualitative Results
-
-<p align="center">
-  <img src="assets/qualitative_results.png" width="90%" />
-</p>
+Building on the original MS-HVED, this version introduces a normalization-free architecture with spectral regularization, consistency training across degradation variations, FOV-aware fusion with obliqueness simulation.
 
 ## Requirements
 
@@ -28,16 +18,9 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
-## Pre-trained Models
+## Training
 
-| Model | Training Data | Link |
-|-------|--------------|------|
-| MS-HVED (T1) | IXI T1 | [Download](https://example.com/placeholder-ixi-t1-model) |
-| MS-HVED (T2) | IXI T2 | [Download](https://example.com/placeholder-ixi-t2-model) |
-
-## Usage
-
-### Training
+### Basic Training
 
 ```bash
 python train.py \
@@ -49,16 +32,100 @@ python train.py \
   --learning_rate 1e-4
 ```
 
-## Orientation Dropout (Handling Missing Views)
+### Full-Featured Training
 
-MS-HVED can be trained to handle missing orientations, useful for inference when not all views are available.
+```bash
+python train.py \
+  --hr_image_dir /path/to/hr/images \
+  --val_image_dir /path/to/val/images \
+  --model_dir ./models \
+  --epochs 200 \
+  --batch_size 2 \
+  --learning_rate 1e-4 \
+  --output_shape 128 128 128 \
+  --recon_loss_type charbonnier \
+  --recon_weight 0.4 \
+  --kl_weight 0.1 \
+  --use_perceptual --perceptual_weight 0.1 \
+  --use_ssim --ssim_weight 0.1 \
+  --orientation_weight 0.4 \
+  --num_variations 2 \
+  --consistency_weight 0.2 \
+  --latent_consistency_weight 0.05 \
+  --enable_obliqueness \
+  --prob_obliqueness 0.5 \
+  --obliqueness_range 15.0 \
+  --mixed_precision fp16 \
+  --use_wandb --wandb_project mshved
+```
+
+### Key Training Arguments
+
+**Architecture:**
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--num_scales` | 4 | Number of hierarchical scales |
+| `--init_filters` | 32 | Initial convolution filters |
+| `--blocks_down` | 1 2 2 4 | Encoder blocks per scale |
+| `--blocks_up` | 1 1 1 | Decoder blocks per scale |
+| `--final_activation` | clamp | Output activation: clamp, sigmoid, tanh, none |
+| `--decoder_upsample_mode` | trilinear | Upsample: trilinear or transpose |
+| `--no_reconstruct_orientations` | | Disable auxiliary orientation reconstruction |
+| `--no_global_residual` | | Disable global residual learning |
+
+**Loss Weights:**
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--recon_loss_type` | charbonnier | Reconstruction loss: l1, l2, charbonnier |
+| `--recon_weight` | 0.4 | Reconstruction loss weight |
+| `--kl_weight` | 0.1 | KL divergence weight (linearly annealed) |
+| `--perceptual_weight` | 0.1 | Perceptual loss weight (requires `--use_perceptual`) |
+| `--ssim_weight` | 0.1 | SSIM loss weight (requires `--use_ssim`) |
+| `--orientation_weight` | 0.4 | Orientation reconstruction weight |
+| `--perceptual_network` | alex | Perceptual backbone: alex, vgg, radimagenet, medicalnet |
+
+**Consistency Training:**
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--num_variations` | 1 | Degradation variations per image (>1 enables consistency) |
+| `--consistency_weight` | 0.2 | Output consistency loss weight |
+| `--latent_consistency_weight` | 0.05 | Latent consistency (symmetric KL) weight |
+| `--consistency_warmup_steps` | 5000 | Linear warmup steps for consistency losses |
+
+**MRI Artifact Simulation:**
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--prob_motion` | 0.5 | Motion ghosting probability |
+| `--prob_spike` | 0.5 | K-space spike probability |
+| `--prob_aliasing` | 0.02 | Aliasing probability |
+| `--prob_bias_field` | 0.5 | B1 bias field probability |
+| `--prob_noise` | 0.8 | Gaussian noise probability |
+| `--fov_augmentation_prob` | 0.7 | FOV slice drop probability |
+| `--no_intensity_aug` | | Disable gamma/clip augmentation |
+
+**Obliqueness Simulation:**
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--enable_obliqueness` | off | Enable affine-based obliqueness simulation |
+| `--prob_obliqueness` | 0.5 | Per-stack probability of oblique rotation |
+| `--obliqueness_range` | 15.0 | Maximum rotation angle in degrees |
+
+**Resolution:**
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--atlas_res` | 1.0 1.0 1.0 | HR voxel resolution in mm |
+| `--min_resolution` | 1.0 1.0 1.0 | Minimum LR resolution |
+| `--max_res_aniso` | 9.0 9.0 9.0 | Maximum through-plane resolution |
+| `--no_randomise_res` | | Disable random resolution sampling |
+
+## Orientation Dropout
+
+MS-HVED++ can handle missing orientations at inference by training with orientation dropout.
 
 ### Random Dropout
 
-Randomly drops 1-2 orientations during training with specified probability:
-
 ```bash
-# 50% chance to drop orientations, keep at least 1 view
+# 50% chance to drop 1-2 orientations per sample, keep at least 1
 python train.py \
   --model_dir ./models \
   --orientation_dropout_prob 0.5 \
@@ -67,63 +134,96 @@ python train.py \
 
 ### Deterministic Dropout
 
-Always drop specific orientations for controlled experiments:
-
 ```bash
-# Always drop axial view (train with coronal + sagittal only)
+# Always drop axial (index 0), train with coronal + sagittal only
 python train.py --model_dir ./models --drop_orientations 0
-
-# Always drop axial and coronal (train with sagittal only)
-python train.py --model_dir ./models --drop_orientations 0 1
 
 # Orientation indices: 0=Axial, 1=Coronal, 2=Sagittal
 ```
 
-**Note:** Deterministic and random dropout are mutually exclusive. If both are specified, deterministic takes precedence.
+## Inference
 
-## Ablation Studies
-
-### SR-Only Training (Disable Orientation Reconstruction)
-
-For ablation studies, you can train with all encoders but only the SR decoder, disabling the auxiliary orientation reconstruction task:
+### Standard Inference
 
 ```bash
-# SR-only training (ablation)
-python train.py \
-  --model_dir ./models/ablation_sr_only \
-  --no_reconstruct_orientations \
-  --orientation_weight 0.0 \
-  --recon_weight 0.8
+python test.py \
+  --input_stacks axial.nii.gz coronal.nii.gz sagittal.nii.gz \
+  --model checkpoint.pth \
+  --output sr_output.nii.gz
 ```
 
-### Preparing Test Data
+### FOV-Aware Inference
+
+When obliqueness-trained models are used on real clinical data, FOV masks improve fusion by telling the model which voxels fall outside each stack's field of view:
+
+```bash
+python test.py \
+  --input_stacks axial.nii.gz coronal.nii.gz sagittal.nii.gz \
+  --fov_masks axial_fov_mask.nii.gz coronal_fov_mask.nii.gz sagittal_fov_mask.nii.gz \
+  --model checkpoint.pth \
+  --output sr_output.nii.gz
+```
+
+### Multi-Sample Inference
+
+Draw multiple stochastic samples from the learned posterior for uncertainty estimation:
+
+```bash
+python test.py \
+  --input_stacks axial.nii.gz coronal.nii.gz sagittal.nii.gz \
+  --model checkpoint.pth \
+  --output sr_output.nii.gz \
+  --num_samples 5
+# Produces: sr_output_sample1.nii.gz ... sr_output_sample5.nii.gz
+```
+
+### Missing Orientations
+
+```bash
+# Inference with axial + coronal only
+python test.py \
+  --input_stacks axial.nii.gz coronal.nii.gz \
+  --orientation_mask 1 1 0 \
+  --model checkpoint.pth \
+  --output sr_output.nii.gz
+```
+
+### Batch Inference (Folder Mode)
+
+```bash
+python test_fov.py \
+  --input_stacks_root /path/to/subjects \
+  --model checkpoint.pth \
+  --output_root /path/to/results \
+  --num_samples 5
+```
+
+In folder mode, FOV masks are auto-discovered: for each stack `<stem>.nii.gz`, the script looks for `<stem>_fov_mask.nii.gz` in the same directory.
+
+## Preparing Test Data
 
 Resample input volumes into orthogonal low-resolution stacks:
+
 ```bash
 python prepare4test.py \
   --input /path/to/input.nii.gz \
   --output_dir /path/to/output
 ```
 
-### Inference
+This produces `axial_upsampled.nii.gz`, `coronal_upsampled.nii.gz`, `sagittal_upsampled.nii.gz`, and their corresponding `*_fov_mask.nii.gz` files.
 
-Run super-resolution on three orthogonal stacks:
+### Standalone FOV Mask Generation
+
+Generate FOV masks for existing clinical LR scans using their native NIfTI headers:
+
 ```bash
-python test.py \
-  --input_stacks axial.nii.gz coronal.nii.gz sagittal.nii.gz \
-  --model /path/to/checkpoint.pth \
-  --output sr_output.nii.gz
+python generate_fov_masks.py \
+  --lr_scans axial.nii.gz coronal.nii.gz sagittal.nii.gz \
+  --hr_reference hr.nii.gz \
+  --output_dir ./fov_masks
 ```
 
-For batch inference over a directory of subjects:
-```bash
-python test.py \
-  --input_stacks_root /path/to/subjects \
-  --model /path/to/checkpoint.pth \
-  --output_root /path/to/results
-```
-
-### Evaluation
+## Evaluation
 
 ```bash
 python evaluate.py \
@@ -135,18 +235,20 @@ python evaluate.py \
 ## Project Structure
 
 ```
-├── train.py             # Training script
-├── test.py              # Inference script
-├── evaluate.py          # Metric computation (PSNR, SSIM, MAE, etc.)
-├── prepare4test.py      # Test data preparation
+ms-hved++/
+├── train.py                 # Training script
+├── test.py                  # Standard inference
+├── evaluate.py              # Metric computation (PSNR, SSIM, MAE, etc.)
+├── prepare4test.py          # Test data preprocessing
 ├── src/
-│   ├── mshved.py        # MS-HVED model
-│   ├── encoder.py       # View-specific encoders
-│   ├── decoder.py       # SR and orientation decoders
-│   ├── fusion.py        # Product-of-Gaussians fusion
-│   ├── losses.py        # Loss functions
-│   ├── data.py          # Data loading and augmentation
-│   └── utils.py         # Utilities
+│   ├── mshved.py            # MS-HVED++ model (encode → fuse → decode)
+│   ├── encoder.py           # Multi-modal encoder with spectral normalization
+│   ├── decoder.py           # SR decoder and multi-output orientation decoder
+│   ├── blocks.py            # Spectral-normed residual blocks (no normalization)
+│   ├── fusion.py            # Product-of-Gaussians fusion with FOV mask support
+│   ├── losses.py            # Loss functions (recon, KL, perceptual, SSIM, consistency)
+│   ├── data.py              # Data pipeline with MRI artifact simulation
+│   └── utils.py             # Utilities (padding, metrics, etc.)
 └── requirements.txt
 ```
 

@@ -2,9 +2,10 @@
 MS-HVED with Regression-Optimized Architecture
 
 Changes from original SegResNet-style:
-- RegressionResBlock: no GroupNorm, LeakyReLU(0.2), residual scaling
-- Kaiming weight initialization with small variational projection init
-- Global residual learning (network predicts residual, not full output)
+- RegressionResBlock: LeakyReLU(0.2), residual scaling
+- Kaiming weight initialization with small variational projection init (used when global_residual=True)
+- Spectral regularization in the encoder module
+- Optional Global residual learning (network predicts residual, not full output)
 - Hardtanh 'clamp' activation (gradient=1 in [0,1])
 """
 
@@ -13,20 +14,33 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Dict, Tuple, Optional, Union
 
-from .encoder import MultiModalSegResEncoder
-from .decoder import SegResDecoder, MultiOutputSegResDecoder
+from .encoder import MultiModalEncoder
+from .decoder import Decoder, MultiOutputDecoder
 from .fusion import MultiScaleFusion
 
 
 class MSHVED(nn.Module):
     """
     MS-HVED with regression-optimized architecture.
-
-    Key features:
-    - Normalization-free residual blocks (optional GroupNorm via use_norm)
-    - Global residual learning: output = mean(inputs) + network_prediction
-    - Kaiming weight initialization
-    - Small variational projection init (prevents KL explosion)
+    Args:
+    - num_orientations: Number of input orientations (default 4)
+    - in_channels: Channels per orientation (default 1)
+    - out_channels: Output channels (default 1)
+    - init_filters: Initial filter count (doubles each scale, default 32)
+    - num_scales: Number of hierarchical scales (default 4)
+    - blocks_down: Residual blocks per encoder scale (default (1, 2, 2, 4))
+    - blocks_up: Residual blocks per decoder scale (default (1, 1, 1))
+    - share_encoder: Share encoder across orientations (default False)
+    - share_decoder: Share decoder for orientation reconstructions (default False)
+    - use_prior: Include prior in Product of Gaussians fusion (default True)
+    - upsample_mode: 'trilinear' (default) or 'transpose'
+    - reconstruct_orientations: Decode orientation reconstructions (default True)
+    - final_activation: 'clamp' (recommended), 'sigmoid', 'tanh', or 'none' (default 'clamp')
+    - global_residual: Enable global residual learning (default False)
+    - smooth_fov: Smooth FOV mask boundaries with Gaussian kernel (default True)
+    - fov_attenuation: Precision suppression depth for out-of-FOV voxels (0=none, 1=full, default 1.0)
+    - fov_transition_width: Gaussian sigma in voxels for FOV boundary smoothing (default 3.0)
+    - use_kaiming_init: If True, apply all explicit init: Kaiming on Conv3d/ConvTranspose3d, small init + negative logvar bias on variational projections, and zero-init on final_conv. If False, fall back to PyTorch defaults everywhere (no custom init). Ignored unless global_residual=True: the explicit init scheme is designed to pair with residual learning, so global_residual=False disables it regardless of this flag (default False).
     """
 
     def __init__(
@@ -38,15 +52,17 @@ class MSHVED(nn.Module):
         num_scales: int = 4,
         blocks_down: Tuple[int, ...] = (1, 2, 2, 4),
         blocks_up: Tuple[int, ...] = (1, 1, 1),
-        num_groups: int = 8,
         share_encoder: bool = False,
         share_decoder: bool = False,
         use_prior: bool = True,
         upsample_mode: str = 'trilinear',
         reconstruct_orientations: bool = True,
         final_activation: str = 'clamp',
-        use_norm: bool = False,
-        global_residual: bool = True,
+        global_residual: bool = False,
+        smooth_fov: bool = True,
+        fov_attenuation: float = 1.0,
+        fov_transition_width: float = 3.0,
+        use_kaiming_init: bool = False,
     ):
         """
         Args:
@@ -57,15 +73,22 @@ class MSHVED(nn.Module):
             num_scales: Number of hierarchical scales
             blocks_down: Residual blocks per encoder scale
             blocks_up: Residual blocks per decoder scale
-            num_groups: Groups for GroupNorm (only used when use_norm=True)
             share_encoder: Share encoder across orientations
             share_decoder: Share decoder for orientation reconstructions
             use_prior: Include prior in Product of Gaussians fusion
             upsample_mode: 'trilinear' (default) or 'transpose'
             reconstruct_orientations: Decode orientation reconstructions
             final_activation: 'clamp' (recommended), 'sigmoid', 'tanh', or 'none'
-            use_norm: Enable GroupNorm in residual blocks (default False)
-            global_residual: Enable global residual learning (default True)
+            global_residual: Enable global residual learning
+            smooth_fov: Smooth FOV mask boundaries with Gaussian kernel (default True)
+            fov_attenuation: Precision suppression depth for out-of-FOV voxels (0=none, 1=full)
+            fov_transition_width: Gaussian sigma in voxels for FOV boundary smoothing
+            use_kaiming_init: If True, apply all explicit init: Kaiming on
+                Conv3d/ConvTranspose3d, small init + negative logvar bias on variational
+                projections, and zero-init on final_conv. If False, fall back to PyTorch
+                defaults everywhere (no custom init). Ignored unless global_residual=True:
+                the explicit init scheme is designed to pair with residual learning, so
+                global_residual=False disables it regardless of this flag.
         """
         super().__init__()
 
@@ -73,6 +96,7 @@ class MSHVED(nn.Module):
         self.num_scales = num_scales
         self.reconstruct_orientations = reconstruct_orientations
         self.global_residual = global_residual
+        self.use_kaiming_init = use_kaiming_init
 
         # When using global residual, the network should output raw residuals
         # (positive and negative), so final activation should be 'none'.
@@ -80,44 +104,44 @@ class MSHVED(nn.Module):
         decoder_activation = 'none' if global_residual else final_activation
 
         # Encoder
-        self.encoder = MultiModalSegResEncoder(
+        self.encoder = MultiModalEncoder(
             num_orientations=num_orientations,
             in_channels=in_channels,
             init_filters=init_filters,
             num_scales=num_scales,
             blocks_per_scale=blocks_down,
-            num_groups=num_groups,
             share_weights=share_encoder,
-            use_norm=use_norm,
         )
 
-        # Fusion (unchanged from original MS-HVED)
-        self.fusion = MultiScaleFusion(num_scales=num_scales, use_prior=use_prior)
+        # Fusion 
+        self.fusion = MultiScaleFusion(
+            num_scales=num_scales,
+            use_prior=use_prior,
+            smooth_fov=smooth_fov,
+            fov_attenuation=fov_attenuation,
+            fov_transition_width=fov_transition_width,
+        )
 
         # Decoder
         if reconstruct_orientations:
-            self.decoder = MultiOutputSegResDecoder(
+            self.decoder = MultiOutputDecoder(
                 num_orientations=num_orientations,
                 out_channels=out_channels,
                 init_filters=init_filters,
                 num_scales=num_scales,
                 blocks_per_scale=blocks_up,
                 upsample_mode=upsample_mode,
-                num_groups=num_groups,
                 share_decoder=share_decoder,
                 final_activation=decoder_activation,
-                use_norm=use_norm,
             )
         else:
-            self.decoder = SegResDecoder(
+            self.decoder = Decoder(
                 out_channels=out_channels,
                 init_filters=init_filters,
                 num_scales=num_scales,
                 blocks_per_scale=blocks_up,
                 upsample_mode=upsample_mode,
-                num_groups=num_groups,
                 final_activation=decoder_activation,
-                use_norm=use_norm,
             )
 
         self.hidden_dims = self.encoder.hidden_dims
@@ -126,7 +150,16 @@ class MSHVED(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """Kaiming initialization for conv layers, small init for variational projections."""
+        """Kaiming initialization for conv layers, small init for variational projections.
+
+        Only applied when global_residual is True — the explicit init scheme (Kaiming +
+        zero-init final conv) is designed to pair with residual learning, where the
+        network predicts a residual around a reference. Without residual learning, we
+        fall back to PyTorch default init.
+        """
+        if not self.use_kaiming_init or not self.global_residual:
+            return
+
         for m in self.modules():
             if isinstance(m, nn.Conv3d):
                 nn.init.kaiming_normal_(m.weight, a=0.2, mode='fan_out', nonlinearity='leaky_relu')
@@ -136,10 +169,6 @@ class MSHVED(nn.Module):
                 nn.init.kaiming_normal_(m.weight, a=0.2, mode='fan_in', nonlinearity='leaky_relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.GroupNorm):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
-
         # Small initialization for variational projections to prevent KL explosion
         for module in self.modules():
             if hasattr(module, 'variational_proj'):
@@ -149,21 +178,22 @@ class MSHVED(nn.Module):
                 out_ch = module.variational_proj.bias.shape[0] // 2
                 module.variational_proj.bias.data[out_ch:] = -2.0
 
-        # Zero-init final conv: output starts as pure reference (global residual)
-        if self.global_residual:
-            if isinstance(self.decoder, MultiOutputSegResDecoder):
-                nn.init.zeros_(self.decoder.main_decoder.final_conv.weight)
-                nn.init.zeros_(self.decoder.main_decoder.final_conv.bias)
-                if hasattr(self.decoder, 'orientation_decoders'):
-                    for od in self.decoder.orientation_decoders:
-                        nn.init.zeros_(od.final_conv.weight)
-                        nn.init.zeros_(od.final_conv.bias)
-                elif hasattr(self.decoder, 'orientation_decoder'):
-                    nn.init.zeros_(self.decoder.orientation_decoder.final_conv.weight)
-                    nn.init.zeros_(self.decoder.orientation_decoder.final_conv.bias)
-            else:
-                nn.init.zeros_(self.decoder.final_conv.weight)
-                nn.init.zeros_(self.decoder.final_conv.bias)
+        # Zero-init final conv so the decoder output starts at 0. With global_residual
+        # this makes the initial prediction equal the reference. Without it, 0 sits
+        # inside the active region of Hardtanh/sigmoid so gradients can flow from step 1.
+        if isinstance(self.decoder, MultiOutputDecoder):
+            nn.init.zeros_(self.decoder.main_decoder.final_conv.weight)
+            nn.init.zeros_(self.decoder.main_decoder.final_conv.bias)
+            if hasattr(self.decoder, 'orientation_decoders'):
+                for od in self.decoder.orientation_decoders:
+                    nn.init.zeros_(od.final_conv.weight)
+                    nn.init.zeros_(od.final_conv.bias)
+            elif hasattr(self.decoder, 'orientation_decoder'):
+                nn.init.zeros_(self.decoder.orientation_decoder.final_conv.weight)
+                nn.init.zeros_(self.decoder.orientation_decoder.final_conv.bias)
+        else:
+            nn.init.zeros_(self.decoder.final_conv.weight)
+            nn.init.zeros_(self.decoder.final_conv.bias)
 
     def _compute_reference(
         self,
@@ -212,11 +242,11 @@ class MSHVED(nn.Module):
         self,
         encoder_outputs: List[Dict[str, Dict[int, torch.Tensor]]],
         orientation_mask: Optional[torch.Tensor] = None,
-        interp_masks: Optional[List[torch.Tensor]] = None,
+        fov_masks: Optional[List[torch.Tensor]] = None,
         deterministic: bool = False
     ) -> Tuple[List[torch.Tensor], List[Tuple[torch.Tensor, torch.Tensor]]]:
         """Fuse via Product of Gaussians and sample."""
-        return self.fusion(encoder_outputs, orientation_mask, interp_masks, deterministic)
+        return self.fusion(encoder_outputs, orientation_mask, fov_masks, deterministic)
 
     def decode(
         self,
@@ -234,7 +264,7 @@ class MSHVED(nn.Module):
         self,
         orientations: List[torch.Tensor],
         orientation_mask: Optional[torch.Tensor] = None,
-        interp_masks: Optional[List[torch.Tensor]] = None,
+        fov_masks: Optional[List[torch.Tensor]] = None,
         deterministic: bool = False
     ) -> Dict[str, Union[torch.Tensor, List]]:
         """
@@ -243,8 +273,8 @@ class MSHVED(nn.Module):
         Args:
             orientations: List of 3 orientation volumes, each (B, C, D, H, W)
             orientation_mask: Binary mask for which orientations are present
-            interp_masks: List of 3 interpolation masks, each (B, 1, D, H, W).
-                         1 = interpolated slice, 0 = acquired slice.
+            fov_masks: List of 3 FOV masks, each (B, 1, D, H, W).
+                         1 = missing (out-of-FOV), 0 = valid.
             deterministic: If True, return means without sampling
 
         Returns:
@@ -255,7 +285,7 @@ class MSHVED(nn.Module):
 
         # Fuse
         latent_samples, posteriors = self.fuse(
-            encoder_outputs, orientation_mask, interp_masks, deterministic
+            encoder_outputs, orientation_mask, fov_masks, deterministic
         )
 
         # Decode

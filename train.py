@@ -5,7 +5,6 @@ This script trains the MS-HVED model using three orthogonal low-resolution stack
 generated from high-resolution volumes. Each stack has high resolution in one
 orientation (axial, coronal, sagittal).
 
-Based on the original SynthSR training pipeline with modifications for MS-HVED.
 """
 
 import os
@@ -53,8 +52,11 @@ def build_model_config(
     init_filters: int = None,
     blocks_down: tuple = None,
     blocks_up: tuple = None,
-    num_groups: int = None,
-    global_residual: bool = True,
+    global_residual: bool = False,
+    smooth_fov: bool = True,
+    fov_attenuation: float = 1.0,
+    fov_transition_width: float = 3.0,
+    use_kaiming_init: bool = False,
 ) -> dict:
     """Build model configuration dictionary for checkpoint saving."""
     config = {
@@ -67,25 +69,37 @@ def build_model_config(
         "init_filters": init_filters,
         "blocks_down": list(blocks_down),
         "blocks_up": list(blocks_up),
-        "num_groups": num_groups,
         "global_residual": global_residual,
+        "smooth_fov": smooth_fov,
+        "fov_attenuation": fov_attenuation,
+        "fov_transition_width": fov_transition_width,
+        "use_kaiming_init": use_kaiming_init,
     }
 
     return config
 
 
-def train_uhved_model(
+def train_mshved_model(
+    # Data sources and outputs
     hr_image_paths: List[str],
     model_dir: str,
+    val_image_paths: List[str] = None,
+    checkpoint: str = None,
+
+    # Training schedule and runtime
     epochs: int = 100,
     batch_size: int = 1,
     learning_rate: float = 1e-4,
-    output_shape: tuple = (128, 128, 128),
-    checkpoint: str = None,
     device: str = "cuda",
     save_interval: int = 10,
     val_interval: int = 1,
-    val_image_paths: List[str] = None,
+    mixed_precision: str = "no",
+    gradient_accumulation_steps: int = 1,
+    max_grad_norm: float = 1.0,
+    seed: int = 42,
+
+    # Data generation and augmentation
+    output_shape: tuple = (128, 128, 128),
     atlas_res: list = [1.0, 1.0, 1.0],
     min_resolution: list = [1.0, 1.0, 1.0],
     max_res_aniso: list = [9.0, 9.0, 9.0],
@@ -101,16 +115,31 @@ def train_uhved_model(
     min_orientations: int = 1,
     drop_orientations: list = None,
     balanced_orientation_combos: bool = False,
+    num_variations: int = 1,
+    upsample_mode: str = "trilinear",
+    enable_obliqueness: bool = False,
+    prob_obliqueness: float = 0.5,
+    obliqueness_range: float = 15.0,
+
+    # Data loading
     num_workers: int = None,
     use_cache: bool = False,
-    use_wandb: bool = False,
-    wandb_project: str = "mshved",
-    wandb_entity: str = None,
-    wandb_run_name: str = None,
+
+    # Model architecture
     num_scales: int = 4,
-    mixed_precision: str = "no",
-    gradient_accumulation_steps: int = 1,
-    seed: int = 42,
+    init_filters: int = 32,
+    blocks_down: list = None,
+    blocks_up: list = None,
+    reconstruct_orientations: bool = True,
+    final_activation: str = "clamp",
+    decoder_upsample_mode: str = "trilinear",
+    global_residual: bool = False,
+    smooth_fov: bool = True,
+    fov_attenuation: float = 1.0,
+    fov_transition_width: float = 3.0,
+    use_kaiming_init: bool = False,
+
+    # Loss configuration
     recon_loss_type: str = "charbonnier",
     recon_weight: float = 0.4,
     kl_weight: float = 0.1,
@@ -121,36 +150,42 @@ def train_uhved_model(
     use_ssim: bool = True,
     perceptual_network: str = 'alex',
     is_fake_3d: bool = False,
-    reconstruct_orientations: bool = True,
-    final_activation: str = "clamp",
-    max_grad_norm: float = 1.0,
-    decoder_upsample_mode: str = "trilinear",
-    upsample_mode: str = "trilinear",
-    init_filters: int = 32,
-    blocks_down: list = None,
-    blocks_up: list = None,
-    num_groups: int = 8,
-    global_residual: bool = True,
-    num_variations: int = 1,
+
+    # Consistency loss
     consistency_weight: float = 0.2,
     latent_consistency_weight: float = 0.05,
     consistency_warmup_steps: int = 5000,
+
+    # Experiment tracking
+    use_wandb: bool = False,
+    wandb_project: str = "mshved",
+    wandb_entity: str = None,
+    wandb_run_name: str = None,
 ):
     """
     Train MS-HVED model with orthogonal LR stacks
 
     Args:
+        Data sources and outputs:
         hr_image_paths: List of paths to high-resolution images
         model_dir: Directory to save trained models
+        val_image_paths: Optional list of validation image paths
+        checkpoint: Optional checkpoint to resume from
+
+        Training schedule and runtime:
         epochs: Number of training epochs
         batch_size: Batch size
         learning_rate: Learning rate
-        output_shape: Output volume shape
-        checkpoint: Optional checkpoint to resume from
         device: 'cuda' or 'cpu'
         save_interval: Save checkpoint every N epochs
         val_interval: Run validation every N epochs
-        val_image_paths: Optional list of validation image paths
+        mixed_precision: Mixed precision training ('no', 'fp16', 'bf16')
+        gradient_accumulation_steps: Number of steps to accumulate gradients
+        max_grad_norm: Maximum gradient norm for clipping (0 to disable)
+        seed: Random seed for reproducibility
+
+        Data generation and augmentation:
+        output_shape: Output volume shape
         atlas_res: Physical resolution of input HR images [x, y, z] in mm
         min_resolution: Minimum resolution for randomization
         max_res_aniso: Maximum anisotropic resolution
@@ -165,18 +200,32 @@ def train_uhved_model(
         orientation_dropout_prob: Probability of applying orientation dropout (0.0-1.0)
         min_orientations: Minimum number of orientations to keep after dropout (1-3)
         drop_orientations: Specific orientations to drop (0=Axial, 1=Coronal, 2=Sagittal). If specified, always drops these.
-        balanced_orientation_combos: Whether to use balanced orientation mask combos per epoch.
-        upsample_mode: Interpolation mode for FFT upsample recovery ('nearest', 'trilinear', 'nearest-exact')
+        balanced_orientation_combos: Whether to use balanced orientation mask combos per epoch. If True, will cycle through a balanced set of orientation dropout combinations each epoch to ensure all views are learned.
+        num_variations: Number of variations to generate per sample for consistency training (default=1, set >1 to enable)
+        upsample_mode: Upsampling strategy for data generator ('trilinear' or 'nearest')
+        enable_obliqueness: Whether to enable obliqueness augmentation
+        prob_obliqueness: Probability of applying obliqueness augmentation
+        obliqueness_range: Maximum angle in degrees for obliqueness augmentation
+
+        Data loading:
         num_workers: Number of data loading workers
         use_cache: Whether to use CacheDataset
-        use_wandb: Whether to use Weights & Biases for tracking
-        wandb_project: W&B project name
-        wandb_entity: W&B entity/team name
-        wandb_run_name: W&B run name
+
+        Model architecture:
         num_scales: Number of hierarchical scales
-        mixed_precision: Mixed precision training ('no', 'fp16', 'bf16')
-        gradient_accumulation_steps: Number of steps to accumulate gradients
-        seed: Random seed for reproducibility
+        init_filters: Number of filters in the first scale of the model (doubled at each subsequent scale)
+        blocks_down: List of number of blocks at each downsampling scale (length should match num_scales)
+        blocks_up: List of number of blocks at each upsampling scale (length should match num_scales)
+        reconstruct_orientations: Whether to include auxiliary decoders for reconstructing input orientations
+        final_activation: Final activation function ('tanh', 'sigmoid', or 'none')
+        decoder_upsample_mode: Decoder upsampling strategy ('trilinear', 'transpose', or 'pixelshuffle')
+        global_residual: Whether to use a global residual connection from input to output
+        smooth_fov: Whether to apply smooth FOV attenuation
+        fov_attenuation: Strength of FOV attenuation (higher = stronger attenuation)
+        fov_transition_width: Width of transition zone for smooth FOV attenuation in mm
+        use_kaiming_init: Whether to use Kaiming initialization for model weights
+
+        Loss configuration:
         recon_loss_type: Type of reconstruction loss ('l1', 'l2', or 'charbonnier')
         recon_weight: Weight for reconstruction loss
         kl_weight: Weight for KL divergence loss
@@ -187,9 +236,17 @@ def train_uhved_model(
         use_ssim: Whether to use SSIM loss
         perceptual_network: MONAI network for perceptual loss ('alex', 'vgg', 'squeeze', 'radimagenet', 'medicalnet', 'resnet50')
         is_fake_3d: Use 2.5D (fake 3D) mode for perceptual loss (False = full 3D, True = 2.5D slices)
-        final_activation: Final activation function ('tanh', 'sigmoid', or 'none')
-        max_grad_norm: Maximum gradient norm for clipping (0 to disable)
-        decoder_upsample_mode: Decoder upsampling strategy ('trilinear', 'transpose', or 'pixelshuffle')
+
+        Consistency loss:
+        consistency_weight: Weight for output consistency loss between variations
+        latent_consistency_weight: Weight for latent consistency loss between variations
+        consistency_warmup_steps: Number of steps to warm up consistency losses (start at 0 weight and linearly increase)
+
+        Experiment tracking:
+        use_wandb: Whether to use Weights & Biases for tracking
+        wandb_project: W&B project name
+        wandb_entity: W&B entity/team name
+        wandb_run_name: W&B run name
     """
     # Initialize Accelerator for multi-GPU training
     accelerator = Accelerator(
@@ -264,7 +321,10 @@ def train_uhved_model(
         min_orientations=min_orientations,
         drop_orientations=drop_orientations,
         upsample_mode=upsample_mode,
-        return_intermediate=False
+        return_intermediate=False,
+        enable_obliqueness=enable_obliqueness,
+        prob_obliqueness=prob_obliqueness,
+        obliqueness_range=obliqueness_range,
     )
 
     # Create dataset
@@ -348,7 +408,6 @@ def train_uhved_model(
         print(f"  - Init filters: {init_filters}")
         print(f"  - Blocks down: {blocks_down}")
         print(f"  - Blocks up: {blocks_up}")
-        print(f"  - Num groups: {num_groups}")
 
     # Other parameters for architectures
     other_params = {
@@ -363,6 +422,10 @@ def train_uhved_model(
         'final_activation': final_activation,
         'upsample_mode': decoder_upsample_mode,
         'global_residual': global_residual,
+        'smooth_fov': smooth_fov,
+        'fov_attenuation': fov_attenuation,
+        'fov_transition_width': fov_transition_width,
+        'use_kaiming_init': use_kaiming_init,
     }
 
     model = create_mshved(
@@ -370,7 +433,6 @@ def train_uhved_model(
         init_filters=init_filters,
         blocks_down=tuple(blocks_down),
         blocks_up=tuple(blocks_up),
-        num_groups=num_groups,
         **other_params
     )
 
@@ -465,7 +527,6 @@ def train_uhved_model(
             "init_filters": init_filters,
             "blocks_down": blocks_down,
             "blocks_up": blocks_up,
-            "num_groups": num_groups,
             "num_variations": num_variations,
             "consistency_weight": consistency_weight if num_variations > 1 else 0.0,
             "latent_consistency_weight": latent_consistency_weight if num_variations > 1 else 0.0,
@@ -540,18 +601,18 @@ def train_uhved_model(
                 v1_idx = batch_idx % num_variations
                 v2_idx = (batch_idx + 1) % num_variations
 
-                v1_lr, v1_res, v1_thick, v1_mask, v1_spatial, v1_interp = variations_data[v1_idx]
+                v1_lr, v1_res, v1_thick, v1_mask, v1_fov = variations_data[v1_idx]
                 v1_orientations = [m.float() for m in v1_lr]
 
                 with accelerator.accumulate(model):
                     # Forward variation 1 (with gradients)
-                    outputs_v1 = model(v1_orientations, orientation_mask=v1_mask, interp_masks=v1_interp)
+                    outputs_v1 = model(v1_orientations, orientation_mask=v1_mask, fov_masks=v1_fov)
 
                     # Forward variation 2 (detached — saves memory)
-                    v2_lr, v2_res, v2_thick, v2_mask, v2_spatial, v2_interp = variations_data[v2_idx]
+                    v2_lr, v2_res, v2_thick, v2_mask, v2_fov = variations_data[v2_idx]
                     v2_orientations = [m.float() for m in v2_lr]
                     with torch.no_grad():
-                        outputs_v2 = model(v2_orientations, orientation_mask=v2_mask, interp_masks=v2_interp)
+                        outputs_v2 = model(v2_orientations, orientation_mask=v2_mask, fov_masks=v2_fov)
 
                     # Detach posteriors from variation 2
                     posteriors_v2_detached = [
@@ -572,15 +633,6 @@ def train_uhved_model(
 
                     loss = losses['total']
 
-
-                    # NaN/Inf detection
-                    if torch.isnan(loss) or torch.isinf(loss):
-                        if accelerator.is_main_process:
-                            components = {k: v.item() if torch.is_tensor(v) else v for k, v in losses.items()}
-                            print(f"WARNING: NaN/Inf loss at batch {batch_idx}. Components: {components}. Skipping batch.")
-                        optimizer.zero_grad()
-                        continue
-
                     # Backward pass
                     optimizer.zero_grad()
                     accelerator.backward(loss)
@@ -596,14 +648,14 @@ def train_uhved_model(
 
             else:
                 # Single-variation mode (original behavior)
-                lr_stacks_list, target_img, resolutions_list, thicknesses_list, orientation_mask, spatial_masks, interp_masks = batch_data
+                lr_stacks_list, target_img, resolutions_list, thicknesses_list, orientation_mask, fov_masks = batch_data
                 orientations = lr_stacks_list
 
                 orientations = [m.float() for m in orientations]
                 target_img = target_img.float()
 
                 with accelerator.accumulate(model):
-                    outputs = model(orientations, orientation_mask=orientation_mask, interp_masks=interp_masks)
+                    outputs = model(orientations, orientation_mask=orientation_mask, fov_masks=fov_masks)
 
                     losses = criterion(
                         sr_output=outputs['sr_output'],
@@ -615,13 +667,6 @@ def train_uhved_model(
                     )
 
                     loss = losses['total']
-
-                    if torch.isnan(loss) or torch.isinf(loss):
-                        if accelerator.is_main_process:
-                            components = {k: v.item() if torch.is_tensor(v) else v for k, v in losses.items()}
-                            print(f"WARNING: NaN/Inf loss at batch {batch_idx}. Components: {components}. Skipping batch.")
-                        optimizer.zero_grad()
-                        continue
 
                     optimizer.zero_grad()
                     accelerator.backward(loss)
@@ -691,12 +736,12 @@ def train_uhved_model(
 
             with torch.no_grad():
                 for val_batch_data in val_dataloader:
-                    lr_stacks_list, target_img, _, _, orientation_mask, spatial_masks, interp_masks = val_batch_data
+                    lr_stacks_list, target_img, _, _, orientation_mask, fov_masks = val_batch_data
                     orientations = [m.float() for m in lr_stacks_list]
                     target_img = target_img.float()
 
-                    # Pass orientation_mask and interp_masks to the model's fusion mechanism
-                    outputs = model(orientations, orientation_mask=orientation_mask, interp_masks=interp_masks)
+                    # Pass orientation_mask and fov_masks to the model's fusion mechanism
+                    outputs = model(orientations, orientation_mask=orientation_mask, fov_masks=fov_masks)
 
                     losses = criterion(
                         sr_output=outputs['sr_output'],
@@ -840,8 +885,11 @@ def train_uhved_model(
                     init_filters=init_filters,
                     blocks_down=tuple(blocks_down) if blocks_down else None,
                     blocks_up=tuple(blocks_up) if blocks_up else None,
-                    num_groups=num_groups,
                     global_residual=global_residual,
+                    smooth_fov=smooth_fov,
+                    fov_attenuation=fov_attenuation,
+                    fov_transition_width=fov_transition_width,
+                    use_kaiming_init=use_kaiming_init,
                 )
 
                 training_config = {
@@ -890,8 +938,11 @@ def train_uhved_model(
                     init_filters=init_filters,
                     blocks_down=tuple(blocks_down) if blocks_down else None,
                     blocks_up=tuple(blocks_up) if blocks_up else None,
-                    num_groups=num_groups,
                     global_residual=global_residual,
+                    smooth_fov=smooth_fov,
+                    fov_attenuation=fov_attenuation,
+                    fov_transition_width=fov_transition_width,
+                    use_kaiming_init=use_kaiming_init,
                 )
 
                 training_config = {
@@ -940,8 +991,11 @@ def train_uhved_model(
             init_filters=init_filters,
             blocks_down=tuple(blocks_down) if blocks_down else None,
             blocks_up=tuple(blocks_up) if blocks_up else None,
-            num_groups=num_groups,
             global_residual=global_residual,
+            smooth_fov=smooth_fov,
+            fov_attenuation=fov_attenuation,
+            fov_transition_width=fov_transition_width,
+            use_kaiming_init=use_kaiming_init,
         )
 
         training_config = {
@@ -999,8 +1053,12 @@ if __name__ == "__main__":
 
     # Training data arguments
     parser.add_argument("--hr_image_dir", type=str, default=None, help="Directory containing HR images")
-    parser.add_argument("--csv_file", type=str, default=None, help="CSV file with image metadata")
-    parser.add_argument("--base_dir", type=str, default=None, help="Base directory for CSV paths")
+    parser.add_argument("--csv_file", type=str, nargs="+", default=None,
+                        help="CSV file(s) with image metadata. Pass multiple paths to "
+                             "combine datasets, e.g. --csv_file a.csv b.csv")
+    parser.add_argument("--base_dir", type=str, nargs="+", default=None,
+                        help="Base director(ies) for CSV relative paths. Must have the "
+                             "same count as --csv_file (one base_dir per CSV).")
     parser.add_argument("--model_dir", type=str, required=True, help="Directory to save models")
     parser.add_argument("--val_image_dir", type=str, default=None, help="Validation images directory")
     parser.add_argument("--mri_classes", type=str, nargs="+", default=None,
@@ -1025,12 +1083,12 @@ if __name__ == "__main__":
                         help="Residual blocks per encoder scale")
     parser.add_argument("--blocks_up", type=int, nargs='+', default=[1, 1, 1],
                         help="Residual blocks per decoder scale")
-    parser.add_argument("--num_groups", type=int, default=8,
-                        help="Number of groups for GroupNorm (default: 8)")
     parser.add_argument("--no_reconstruct_orientations", action="store_true",
                         help="Disable orientation reconstruction (SR decoder only, for ablation studies)")
-    parser.add_argument("--no_global_residual", action="store_true",
-                        help="Disable global residual learning (network predicts full output instead of residual)")
+    parser.add_argument("--global_residual", action="store_true",
+                        help="Enable global residual learning (network predicts residual instead of full output)")
+    parser.add_argument("--kaiming_init", action="store_true",
+                        help="Enable explicit Kaiming init on Conv3d/ConvTranspose3d weights")
 
     # Training parameters
     parser.add_argument("--epochs", type=int, default=100, help="Number of epochs")
@@ -1102,6 +1160,24 @@ if __name__ == "__main__":
                         choices=["nearest", "trilinear", "nearest-exact"],
                         help="Interpolation mode for FFT upsample recovery (default: nearest)")
 
+    # Obliqueness simulation
+    parser.add_argument("--enable_obliqueness", action="store_true",
+                        help="Enable oblique slice simulation (tilted LR stacks with affine resampling)")
+    parser.add_argument("--prob_obliqueness", type=float, default=0.5,
+                        help="Probability of applying obliqueness per stack (when enabled)")
+    parser.add_argument("--obliqueness_range", type=float, default=15.0,
+                        help="Maximum rotation angle in degrees per axis for obliqueness")
+
+    # FOV fusion parameters
+    parser.add_argument("--smooth_fov", action="store_true", default=True,
+                        help="Smooth FOV mask boundaries with Gaussian kernel (default: True)")
+    parser.add_argument("--no_smooth_fov", action="store_true",
+                        help="Disable FOV mask smoothing (use hard binary boundaries)")
+    parser.add_argument("--fov_attenuation", type=float, default=1.0,
+                        help="Precision suppression for out-of-FOV voxels (0=none, 1=full). Default: 1.0")
+    parser.add_argument("--fov_transition_width", type=float, default=3.0,
+                        help="Gaussian sigma in voxels for FOV boundary smoothing. Default: 3.0")
+
     # Other parameters
     parser.add_argument("--device", type=str, default="cuda", help="Device")
     parser.add_argument("--checkpoint", type=str, default=None, help="Checkpoint to resume from")
@@ -1123,6 +1199,17 @@ if __name__ == "__main__":
     acquisition_types = args.acquisition_types
     if acquisition_types and len(acquisition_types) == 1 and acquisition_types[0].lower() == "all":
         acquisition_types = None
+
+    # Validate --csv_file / --base_dir pairing
+    if args.csv_file is not None:
+        if args.base_dir is None:
+            raise ValueError("--base_dir is required when using --csv_file")
+        if len(args.csv_file) != len(args.base_dir):
+            raise ValueError(
+                f"Number of --csv_file entries ({len(args.csv_file)}) must match "
+                f"number of --base_dir entries ({len(args.base_dir)}). "
+                f"Got csv_file={args.csv_file}, base_dir={args.base_dir}"
+            )
 
     # Validate orientation dropout settings
     if args.drop_orientations is not None and len(args.drop_orientations) > 0:
@@ -1183,18 +1270,27 @@ if __name__ == "__main__":
     blocks_up = args.blocks_up if hasattr(args, 'blocks_up') else [1, 1, 1]
 
     # Train model
-    train_uhved_model(
+    train_mshved_model(
+        # Data sources and outputs
         hr_image_paths=hr_image_paths,
         model_dir=args.model_dir,
+        val_image_paths=val_image_paths,
+        checkpoint=args.checkpoint,
+
+        # Training schedule and runtime
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
-        output_shape=tuple(args.output_shape),
-        checkpoint=args.checkpoint,
         device=args.device,
         save_interval=args.save_interval,
         val_interval=args.val_interval,
-        val_image_paths=val_image_paths,
+        mixed_precision=args.mixed_precision,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        max_grad_norm=args.max_grad_norm,
+        seed=args.seed,
+
+        # Data generation and augmentation
+        output_shape=tuple(args.output_shape),
         atlas_res=args.atlas_res,
         min_resolution=args.min_resolution,
         max_res_aniso=args.max_res_aniso,
@@ -1210,16 +1306,30 @@ if __name__ == "__main__":
         min_orientations=args.min_orientations,
         drop_orientations=args.drop_orientations,
         balanced_orientation_combos=args.balanced_orientation_combos,
+        num_variations=args.num_variations,
+        upsample_mode=args.upsample_mode,
+        enable_obliqueness=args.enable_obliqueness,
+        prob_obliqueness=args.prob_obliqueness,
+        obliqueness_range=args.obliqueness_range,
+
+        # Data loading
         num_workers=args.num_workers,
         use_cache=args.use_cache,
-        use_wandb=args.use_wandb,
-        wandb_project=args.wandb_project,
-        wandb_entity=args.wandb_entity,
-        wandb_run_name=args.wandb_run_name,
+
+        # Model architecture
         num_scales=args.num_scales,
-        mixed_precision=args.mixed_precision,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        seed=args.seed,
+        init_filters=args.init_filters,
+        blocks_down=blocks_down,
+        blocks_up=blocks_up,
+        reconstruct_orientations=not args.no_reconstruct_orientations,
+        decoder_upsample_mode=args.decoder_upsample_mode,
+        global_residual=args.global_residual,
+        smooth_fov=not args.no_smooth_fov,
+        fov_attenuation=args.fov_attenuation,
+        fov_transition_width=args.fov_transition_width,
+        use_kaiming_init=args.kaiming_init,
+
+        # Loss configuration
         recon_loss_type=args.recon_loss_type,
         recon_weight=args.recon_weight,
         kl_weight=args.kl_weight,
@@ -1230,17 +1340,15 @@ if __name__ == "__main__":
         use_ssim=args.use_ssim,
         perceptual_network=args.perceptual_network,
         is_fake_3d=args.is_fake_3d,
-        reconstruct_orientations=not args.no_reconstruct_orientations,
-        max_grad_norm=args.max_grad_norm,
-        decoder_upsample_mode=args.decoder_upsample_mode,
-        upsample_mode=args.upsample_mode,
-        init_filters=args.init_filters,
-        blocks_down=blocks_down,
-        blocks_up=blocks_up,
-        num_groups=args.num_groups,
-        global_residual=not args.no_global_residual,
-        num_variations=args.num_variations,
+
+        # Consistency loss
         consistency_weight=args.consistency_weight,
         latent_consistency_weight=args.latent_consistency_weight,
         consistency_warmup_steps=args.consistency_warmup_steps,
+
+        # Experiment tracking
+        use_wandb=args.use_wandb,
+        wandb_project=args.wandb_project,
+        wandb_entity=args.wandb_entity,
+        wandb_run_name=args.wandb_run_name,
     )
