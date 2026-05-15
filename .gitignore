@@ -173,6 +173,12 @@ unet_*/
 mshved_*/
 mshved++_*/
 output/
+full_evaluations/
+mask_evaluations/
+new_evaluations/
+paper/
+paper_journal/
+paper_journal_old/
 # IDE specific files
 .vscode/
 .idea/

@@ -801,6 +801,7 @@ def _apply_fov_slice_drop(
     through_plane_axis: int,
     keep_fraction: float,
     force_both_sides: bool = True,
+    drop_from_start: Optional[bool] = None,
 ) -> torch.Tensor:
     """Zero out edge slices along the through-plane axis.
 
@@ -809,6 +810,9 @@ def _apply_fov_slice_drop(
         through_plane_axis: Spatial axis index (0=D, 1=H, 2=W).
         keep_fraction: Fraction of slices to keep (0, 1].
         force_both_sides: If True, drop from both ends equally.
+        drop_from_start: When ``force_both_sides=False``, controls which end
+            to drop. ``None`` samples randomly. Pass an explicit boolean to
+            share the same side across paired calls (e.g. image + support).
 
     Returns:
         Same-shape tensor with edge slices zeroed.
@@ -833,7 +837,8 @@ def _apply_fov_slice_drop(
             slices_right[axis] = slice(axis_size - drop_right, axis_size)
             output[tuple(slices_right)] = 0
     else:
-        drop_from_start = torch.rand(1).item() < 0.5
+        if drop_from_start is None:
+            drop_from_start = torch.rand(1).item() < 0.5
         slices = [slice(None)] * volume.ndim
         if drop_from_start:
             slices[axis] = slice(0, n_drop)
@@ -1024,6 +1029,8 @@ class MRIArtifactSimulator(torch.nn.Module):
                 scale_factor = new_size / original_shape[spatial_axis]
                 img = torch.real(torch.fft.ifftn(cropped_fft, dim=(1, 2, 3))) * scale_factor
 
+                support_mask = torch.ones(1, *img.shape[1:], device=device)
+
                 # FOV slice drop at native LR resolution
                 if (
                     fov_drop_decision is not None
@@ -1031,8 +1038,24 @@ class MRIArtifactSimulator(torch.nn.Module):
                     and fov_keep_fraction is not None
                 ):
                     keep_frac = fov_keep_fraction[b].item()
+                    drop_from_start = (
+                        None
+                        if fov_force_both_sides
+                        else bool(torch.rand(1).item() < 0.5)
+                    )
                     img = _apply_fov_slice_drop(
-                        img, downsample_axis, keep_frac, fov_force_both_sides,
+                        img,
+                        downsample_axis,
+                        keep_frac,
+                        fov_force_both_sides,
+                        drop_from_start=drop_from_start,
+                    )
+                    support_mask = _apply_fov_slice_drop(
+                        support_mask,
+                        downsample_axis,
+                        keep_frac,
+                        fov_force_both_sides,
+                        drop_from_start=drop_from_start,
                     )
 
                 # Determine target shape based on configuration
@@ -1090,15 +1113,21 @@ class MRIArtifactSimulator(torch.nn.Module):
                             img, lr_affine_aligned, lr_affine_oblique,
                             lr_native_shape, mode="bilinear",
                         )
+                        oblique_support = affine_resample_3d(
+                            support_mask, lr_affine_aligned, lr_affine_oblique,
+                            lr_native_shape, mode="nearest",
+                        )
 
                         # Capture true LR if requested
                         if return_intermediate:
                             true_lr_img = oblique_lr.clone()
 
-                        # Register oblique LR -> HR grid (FOV mask captures obliqueness only)
+                        # Register oblique LR -> HR grid. The support mask
+                        # carries both oblique out-of-bounds and FOV drops.
                         img, fov_mask = resample_with_fov_mask(
                             oblique_lr, lr_affine_oblique, hr_affine,
                             tuple(target_shape), mode="bilinear",
+                            support_mask=oblique_support,
                         )
                     else:
                         # No rotation — direct axis-aligned resampling
@@ -1108,6 +1137,7 @@ class MRIArtifactSimulator(torch.nn.Module):
                         img, fov_mask = resample_with_fov_mask(
                             img, lr_affine_aligned, hr_affine,
                             tuple(target_shape), mode="bilinear",
+                            support_mask=support_mask,
                         )
                 else:
                     # --- Existing F.interpolate path ---
@@ -1123,8 +1153,14 @@ class MRIArtifactSimulator(torch.nn.Module):
                             mode=self.upsample_mode,
                         ).squeeze(0)
 
-                    # No obliqueness — FOV mask is all zeros (nothing missing)
-                    fov_mask = torch.zeros(1, *img.shape[1:], device=device)
+                    if list(support_mask.shape[1:]) != list(target_shape):
+                        support_mask = torch.nn.functional.interpolate(
+                            support_mask.unsqueeze(0),
+                            size=target_shape,
+                            mode="nearest",
+                        ).squeeze(0)
+
+                    fov_mask = 1.0 - support_mask
 
             else:
                 fov_mask = torch.zeros(1, *img.shape[1:], device=device)

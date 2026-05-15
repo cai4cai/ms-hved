@@ -22,6 +22,10 @@ Usage:
   # Skip FOV mask generation (behaves like original prepare4test.py)
   python prepare4test.py -i ax.nii.gz cor.nii.gz sag.nii.gz \\
       -o out/ --fixed-path hr.nii.gz --no-fov-masks -v
+
+  # Use SimpleITK for the initial spacing/orientation resampling
+  python prepare4test.py -i ax.nii.gz cor.nii.gz sag.nii.gz \\
+      -o out/ --fixed-path hr.nii.gz --resampler simpleitk -v
 """
 
 import argparse
@@ -55,7 +59,8 @@ def resample_monai(path: str, resolution: list, orientation: str = "RAS", interp
     return data.squeeze(0).cpu().numpy(), affine, nib.load(path).header
 
 
-def resample_nilearn(path: str, resolution: list, orientation: str = "RAS"):
+def resample_nilearn(path: str, resolution: list, orientation: str = "RAS",
+                     interp: str = "trilinear"):
     """Resample NIfTI to target resolution and orientation using nilearn."""
     from nilearn import image
     from nilearn.image import reorder_img
@@ -67,21 +72,93 @@ def resample_nilearn(path: str, resolution: list, orientation: str = "RAS"):
             stacklevel=3,
         )
 
+    interpolation = 'nearest' if interp == 'nearest' else 'continuous'
+    reorder_interpolation = 'nearest' if interp == 'nearest' else 'linear'
     resampled_img = image.resample_img(
         str(path),
         target_affine=np.eye(3) * resolution[0],
-        interpolation='continuous',
+        interpolation=interpolation,
     )
-    reoriented_img = reorder_img(resampled_img, resample='linear')
+    reoriented_img = reorder_img(resampled_img, resample=reorder_interpolation)
     data = reoriented_img.get_fdata().astype(np.float32)
     return data, reoriented_img.affine, reoriented_img.header
 
 
+def _sitk_interpolator(interp: str):
+    """Map this script's interpolation names to SimpleITK constants."""
+    import SimpleITK as sitk
+
+    if interp == "nearest":
+        return sitk.sitkNearestNeighbor
+    if interp in {"bilinear", "trilinear"}:
+        return sitk.sitkLinear
+    raise ValueError(f"Unsupported SimpleITK interpolation mode: {interp}")
+
+
+def _sitk_image_to_ras_affine(img) -> np.ndarray:
+    """Build a nibabel RAS affine from a SimpleITK image.
+
+    SimpleITK stores physical coordinates in LPS. NIfTI/nibabel affines are
+    conventionally interpreted in RAS, so both the direction matrix and origin
+    need an LPS -> RAS conversion.
+    """
+    direction_lps = np.asarray(img.GetDirection(), dtype=np.float64).reshape(3, 3)
+    spacing = np.asarray(img.GetSpacing(), dtype=np.float64)
+    origin_lps = np.asarray(img.GetOrigin(), dtype=np.float64)
+    lps_to_ras = np.diag([-1.0, -1.0, 1.0])
+
+    affine = np.eye(4, dtype=np.float64)
+    affine[:3, :3] = lps_to_ras @ direction_lps @ np.diag(spacing)
+    affine[:3, 3] = lps_to_ras @ origin_lps
+    return affine
+
+
+def resample_simpleitk(path: str, resolution: list, orientation: str = "RAS",
+                       interp: str = "trilinear"):
+    """Resample NIfTI to target resolution/orientation using SimpleITK."""
+    import SimpleITK as sitk
+
+    img = sitk.ReadImage(str(path))
+    if img.GetDimension() != 3:
+        raise ValueError(f"SimpleITK backend expects a 3D image: {path}")
+
+    if orientation:
+        orient = sitk.DICOMOrientImageFilter()
+        orient.SetDesiredCoordinateOrientation(orientation.upper())
+        img = orient.Execute(img)
+
+    in_spacing = np.asarray(img.GetSpacing(), dtype=np.float64)
+    in_size = np.asarray(img.GetSize(), dtype=np.int64)
+    out_spacing = np.asarray(resolution, dtype=np.float64)
+    out_size = np.maximum(np.round(in_size * in_spacing / out_spacing), 1).astype(np.int64)
+
+    resampler = sitk.ResampleImageFilter()
+    resampler.SetSize([int(v) for v in out_size])
+    resampler.SetOutputSpacing(tuple(float(v) for v in out_spacing))
+    resampler.SetOutputOrigin(img.GetOrigin())
+    resampler.SetOutputDirection(img.GetDirection())
+    resampler.SetTransform(sitk.Transform())
+    resampler.SetInterpolator(_sitk_interpolator(interp))
+    resampler.SetDefaultPixelValue(0.0)
+    out_img = resampler.Execute(img)
+
+    # SimpleITK arrays are z, y, x; nibabel expects x, y, z for the affine.
+    data = np.transpose(sitk.GetArrayFromImage(out_img), (2, 1, 0)).astype(np.float32)
+    affine = _sitk_image_to_ras_affine(out_img)
+    header = nib.load(path).header.copy()
+    header.set_data_shape(data.shape)
+    header.set_data_dtype(np.float32)
+    header.set_zooms(tuple(float(v) for v in out_spacing))
+    return data, affine, header
+
+
 def resample(path: str, resolution: list, orientation: str = "RAS",
              interp: str = "trilinear", backend: str = "monai"):
-    """Resample NIfTI using the chosen backend ('monai' or 'nilearn')."""
+    """Resample NIfTI using the chosen backend."""
     if backend == "nilearn":
-        return resample_nilearn(path, resolution, orientation)
+        return resample_nilearn(path, resolution, orientation, interp)
+    if backend == "simpleitk":
+        return resample_simpleitk(path, resolution, orientation, interp)
     return resample_monai(path, resolution, orientation, interp)
 
 
@@ -134,6 +211,25 @@ def warp_to_orig_res(orig_path, fixed_ants, transforms, out_path):
     warped.to_filename(out_path)
 
 
+def apply_registration_to_support(support_path: str, fixed_path: str,
+                                  transforms: list | None, out_path: str) -> str:
+    """Apply image registration transforms to a binary support mask."""
+    if not transforms:
+        nib.save(nib.load(support_path), out_path)
+        return out_path
+
+    fixed = ants.image_read(fixed_path)
+    moving = ants.image_read(support_path)
+    warped = ants.apply_transforms(
+        fixed=fixed,
+        moving=moving,
+        transformlist=transforms,
+        interpolator='nearestNeighbor',
+    )
+    warped.to_filename(out_path)
+    return out_path
+
+
 # ========== EDGE TRIMMING ==========
 
 def trim_slice_edges(registered_path, orig_path, out_path, n_first=0, n_last=0):
@@ -176,6 +272,39 @@ def trim_slice_edges(registered_path, orig_path, out_path, n_first=0, n_last=0):
 
 
 # ========== FOV MASK GENERATION ==========
+
+def create_support_mask(input_path: str, output_path: str) -> str:
+    """Create a binary valid-support image in the input image geometry."""
+    img = nib.load(input_path)
+    data = np.ones(img.shape[:3], dtype=np.float32)
+    header = img.header.copy()
+    header.set_data_shape(data.shape)
+    header.set_data_dtype(np.float32)
+    nib.save(nib.Nifti1Image(data, img.affine, header), output_path)
+    return output_path
+
+
+def support_to_fov_mask(support_path: str, reference_path: str) -> np.ndarray:
+    """Convert a registered 1=valid support image into a 1=missing FOV mask."""
+    support_img = nib.load(support_path)
+    reference_img = nib.load(reference_path)
+    support = support_img.get_fdata(dtype=np.float32)
+
+    if (
+        support.shape[:3] != reference_img.shape[:3]
+        or not np.allclose(support_img.affine, reference_img.affine, atol=1e-4)
+    ):
+        support_t = torch.from_numpy(support).unsqueeze(0)
+        support = affine_resample_3d(
+            support_t,
+            torch.from_numpy(support_img.affine.astype(np.float32)),
+            torch.from_numpy(reference_img.affine.astype(np.float32)),
+            reference_img.shape[:3],
+            mode="nearest",
+        )[0].numpy()
+
+    valid = (support > 0.5).astype(np.float32)
+    return 1.0 - valid
 
 def compute_fov_mask(stack_path: str, original_input_path: str,
                      hr_reference_path: str, verbose: bool = False) -> np.ndarray:
@@ -272,12 +401,19 @@ def run_pipeline(
     current = list(inputs)
     original_inputs = list(inputs)
     temp_dir = tempfile.mkdtemp()
+    support_paths = []
+    if do_fov_masks:
+        for i, path in enumerate(original_inputs):
+            support_paths.append(
+                create_support_mask(path, os.path.join(temp_dir, f"support_{i}.nii.gz"))
+            )
 
     # Stage 1: Resample inputs
     if do_resample:
         if verbose:
             print(f"=== Resampling (backend: {resampler}) ===")
         resampled = []
+        resampled_support = []
         for i, path in enumerate(current):
             if verbose:
                 print(f"  {Path(path).name}")
@@ -285,7 +421,21 @@ def run_pipeline(
             out = os.path.join(temp_dir, f"resampled_{i}.nii.gz")
             save_nifti(data, affine, header, out)
             resampled.append(out)
+            if do_fov_masks:
+                support_data, support_affine, support_header = resample(
+                    support_paths[i], resolution, orientation, "nearest", resampler
+                )
+                support_out = os.path.join(temp_dir, f"support_resampled_{i}.nii.gz")
+                save_nifti(
+                    (support_data > 0.5).astype(np.float32),
+                    support_affine,
+                    support_header,
+                    support_out,
+                )
+                resampled_support.append(support_out)
         current = resampled
+        if do_fov_masks:
+            support_paths = resampled_support
 
     # Stage 2: Register
     fwd_transforms = [None] * len(inputs)
@@ -328,16 +478,27 @@ def run_pipeline(
         reg_fixed_ants = ants.image_read(reg_fixed)
 
         registered = []
+        registered_support = []
         for i, path in enumerate(current):
             if fixed_path is None and i == (fixed_idx if fixed_idx is not None else 0):
                 registered.append(path)
+                if do_fov_masks:
+                    registered_support.append(support_paths[i])
             else:
                 if verbose:
                     print(f"  {Path(path).name} -> fixed")
                 reg_path, transforms = register_to_fixed(reg_fixed, path, transform_type, metric)
                 fwd_transforms[i] = transforms
                 registered.append(reg_path)
+                if do_fov_masks:
+                    support_out = os.path.join(temp_dir, f"support_registered_{i}.nii.gz")
+                    apply_registration_to_support(
+                        support_paths[i], reg_fixed, transforms, support_out
+                    )
+                    registered_support.append(support_out)
         current = registered
+        if do_fov_masks:
+            support_paths = registered_support
     else:
         # No registration — use first input as reference for FOV masks
         hr_reference_for_fov = current[0]
@@ -350,13 +511,21 @@ def run_pipeline(
         else:
             print("=== Saving outputs ===")
     final_outputs = []
-    for orig, curr in zip(inputs, current):
+    final_support_outputs = []
+    for i, (orig, curr) in enumerate(zip(inputs, current)):
         stem = Path(orig).stem.replace('.nii', '')
         out_path = os.path.join(output_dir, f"{stem}.nii.gz")
         if do_trim:
             trim_slice_edges(curr, orig, out_path, trim_first, trim_last)
         else:
             nib.save(nib.load(curr), out_path)
+        if do_fov_masks:
+            support_out = os.path.join(temp_dir, f"support_final_{i}.nii.gz")
+            if do_trim:
+                trim_slice_edges(support_paths[i], orig, support_out, trim_first, trim_last)
+            else:
+                nib.save(nib.load(support_paths[i]), support_out)
+            final_support_outputs.append(support_out)
         if verbose:
             print(f"  Saved: {out_path}")
         final_outputs.append(out_path)
@@ -365,20 +534,18 @@ def run_pipeline(
     if do_fov_masks and hr_reference_for_fov is not None:
         if verbose:
             print("=== Computing FOV masks ===")
-        for orig, out_path in zip(original_inputs, final_outputs):
+        for orig, support_path in zip(original_inputs, final_support_outputs):
             stem = Path(orig).stem.replace('.nii', '')
             if verbose:
                 print(f"  {stem}:")
-            fov_mask = compute_fov_mask(
-                stack_path=out_path,
-                original_input_path=orig,
-                hr_reference_path=hr_reference_for_fov,
-                verbose=verbose,
-            )
+            fov_mask = support_to_fov_mask(support_path, hr_reference_for_fov)
             mask_path = os.path.join(output_dir, f"{stem}_fov_mask.nii.gz")
             hr_affine = nib.load(hr_reference_for_fov).affine
             nib.save(nib.Nifti1Image(fov_mask, hr_affine), mask_path)
             if verbose:
+                n_missing = int((fov_mask > 0.5).sum())
+                n_total = fov_mask.size
+                print(f"    FOV mask: {n_missing}/{n_total} missing ({100 * n_missing / n_total:.1f}%)")
                 print(f"    Saved: {mask_path}")
 
     # Optional: re-apply transforms to original-resolution inputs
@@ -438,8 +605,9 @@ Examples:
     parser.add_argument("--orientation", default="RAS",
                         help="Target orientation (default: RAS)")
     parser.add_argument("--interp", choices=["trilinear", "bilinear", "nearest"],
-                        default="trilinear", help="Interpolation mode for MONAI (default: trilinear)")
-    parser.add_argument("--resampler", choices=["monai", "nilearn"], default="monai",
+                        default="trilinear",
+                        help="Interpolation mode for MONAI/SimpleITK (default: trilinear)")
+    parser.add_argument("--resampler", choices=["monai", "nilearn", "simpleitk"], default="monai",
                         help="Resampling backend (default: monai)")
     parser.add_argument("--fixed", type=int, default=None,
                         help="Index of input image to use as fixed for registration (default: 0)")

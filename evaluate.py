@@ -22,12 +22,12 @@ Usage:
         --output_json results.json
 """
 
-import os
 import argparse
 import csv
 import json
 import logging
-from typing import Dict, Any, List
+import os
+from typing import Dict, Any, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -36,6 +36,25 @@ from tqdm import tqdm
 
 # Import metrics from project
 from src.utils import calculate_metrics
+
+
+STACK_MASK_CANDIDATES = {
+    "axial": [
+        "axial_upsampled_fov_mask.nii.gz",
+        "axial_fov_mask.nii.gz",
+        "stack_0_axial_fov_mask.nii.gz",
+    ],
+    "coronal": [
+        "coronal_upsampled_fov_mask.nii.gz",
+        "coronal_fov_mask.nii.gz",
+        "stack_1_coronal_fov_mask.nii.gz",
+    ],
+    "sagittal": [
+        "sagittal_upsampled_fov_mask.nii.gz",
+        "sagittal_fov_mask.nii.gz",
+        "stack_2_sagittal_fov_mask.nii.gz",
+    ],
+}
 
 
 def load_nifti_volume(file_path: str) -> np.ndarray:
@@ -127,6 +146,86 @@ def center_crop_to_match(volume1: np.ndarray, volume2: np.ndarray) -> tuple:
     return cropped1, cropped2
 
 
+def center_crop_volume(volume: np.ndarray, target_shape: Sequence[int]) -> np.ndarray:
+    """Center crop a volume to target_shape."""
+    shape = np.array(volume.shape)
+    target_shape = np.array(target_shape)
+    start = (shape - target_shape) // 2
+    end = start + target_shape
+    return volume[start[0]:end[0], start[1]:end[1], start[2]:end[2]]
+
+
+def center_crop_to_common(volumes: Sequence[np.ndarray]) -> List[np.ndarray]:
+    """Center crop all volumes to their minimum common spatial shape."""
+    min_shape = np.min([np.array(volume.shape) for volume in volumes], axis=0)
+    return [center_crop_volume(volume, min_shape) for volume in volumes]
+
+
+def resolve_stack_mask_name(subject_dir: str, stack: str) -> str:
+    """Return the first existing mask filename for a stack in a subject directory."""
+    for filename in STACK_MASK_CANDIDATES[stack]:
+        if os.path.exists(os.path.join(subject_dir, filename)):
+            return filename
+    raise FileNotFoundError(
+        f"No FOV mask found for stack '{stack}' in {subject_dir}. "
+        f"Tried: {', '.join(STACK_MASK_CANDIDATES[stack])}"
+    )
+
+
+def load_eval_mask(
+    subject_dir: str,
+    mask_names: Optional[Sequence[str]] = None,
+    eval_stacks: Optional[Sequence[str]] = None,
+    mask_mode: str = "missing",
+    mask_threshold: float = 0.5,
+) -> Optional[np.ndarray]:
+    """
+    Load and combine optional evaluation masks for a subject.
+
+    FOV masks are usually encoded as 1=missing, 0=valid. When multiple masks
+    are provided, valid regions are combined with a union so that evaluation
+    covers any voxel supported by at least one stack used by the method.
+    """
+    names = list(mask_names or [])
+
+    for stack in eval_stacks or []:
+        names.append(resolve_stack_mask_name(subject_dir, stack))
+
+    if not names:
+        return None
+
+    valid_mask = None
+    for name in names:
+        mask_path = name if os.path.isabs(name) else os.path.join(subject_dir, name)
+        if not os.path.exists(mask_path):
+            raise FileNotFoundError(f"Mask file not found: {mask_path}")
+
+        mask_volume = nib.load(mask_path).get_fdata()
+        if mask_volume.ndim != 3:
+            raise ValueError(f"Expected 3D mask at {mask_path}, got shape {mask_volume.shape}")
+
+        if mask_mode == "missing":
+            current_valid = mask_volume <= mask_threshold
+        elif mask_mode == "valid":
+            current_valid = mask_volume > mask_threshold
+        else:
+            raise ValueError(f"Unknown mask_mode: {mask_mode}")
+
+        valid_mask = current_valid if valid_mask is None else np.logical_or(valid_mask, current_valid)
+
+    return valid_mask.astype(bool)
+
+
+def mask_bounding_box(mask: np.ndarray) -> tuple:
+    """Return slicing tuple for the tight bounding box around a boolean mask."""
+    coords = np.argwhere(mask)
+    if coords.size == 0:
+        raise ValueError("Evaluation mask has no valid voxels")
+    start = coords.min(axis=0)
+    end = coords.max(axis=0) + 1
+    return tuple(slice(start[axis], end[axis]) for axis in range(mask.ndim))
+
+
 def compute_ncc(pred: np.ndarray, gt: np.ndarray) -> float:
     """
     Compute Normalized Cross-Correlation (NCC).
@@ -155,13 +254,78 @@ def compute_ncc(pred: np.ndarray, gt: np.ndarray) -> float:
     return float(ncc)
 
 
+def compute_masked_metrics(
+    pred_volume: np.ndarray,
+    gt_volume: np.ndarray,
+    eval_mask: np.ndarray,
+    use_perceptual: bool = False,
+    perceptual_network: str = 'alex',
+    is_fake_3d: bool = True,
+) -> Dict[str, float]:
+    """Compute metrics inside eval_mask only."""
+    valid_voxels = int(eval_mask.sum())
+    if valid_voxels == 0:
+        raise ValueError("Evaluation mask has no valid voxels")
+
+    pred_values = pred_volume[eval_mask]
+    gt_values = gt_volume[eval_mask]
+    diff = pred_values - gt_values
+
+    mae = float(np.mean(np.abs(diff)))
+    mse = float(np.mean(diff ** 2))
+    rmse = float(np.sqrt(mse))
+    psnr = float(10 * np.log10(1.0 / mse)) if mse > 0 else float("inf")
+
+    target_mean = np.mean(gt_values)
+    ss_tot = float(np.sum((gt_values - target_mean) ** 2))
+    ss_res = float(np.sum(diff ** 2))
+    r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+    metrics = {
+        "mae": mae,
+        "mse": mse,
+        "rmse": rmse,
+        "psnr": psnr,
+        "r2": r2,
+    }
+
+    # SSIM/perceptual are spatial metrics, so compute them on the mask bbox
+    # after making outside-mask voxels identical to ground truth.
+    ssim_pred = pred_volume.copy()
+    ssim_pred[~eval_mask] = gt_volume[~eval_mask]
+    bbox = mask_bounding_box(eval_mask)
+    gt_tensor = torch.from_numpy(gt_volume[bbox]).float().unsqueeze(0).unsqueeze(0)
+    pred_tensor = torch.from_numpy(ssim_pred[bbox]).float().unsqueeze(0).unsqueeze(0)
+    spatial_metrics = calculate_metrics(
+        pred_tensor,
+        gt_tensor,
+        max_val=1.0,
+        use_perceptual=use_perceptual,
+        perceptual_network=perceptual_network,
+        is_fake_3d=is_fake_3d,
+    )
+    metrics["ssim"] = spatial_metrics["ssim"]
+    if "perceptual_loss" in spatial_metrics:
+        metrics["perceptual_loss"] = spatial_metrics["perceptual_loss"]
+
+    metrics["ncc"] = compute_ncc(pred_values, gt_values)
+    metrics["coverage_fraction"] = float(valid_voxels / eval_mask.size)
+    metrics["mask_voxels"] = float(valid_voxels)
+
+    return metrics
+
+
 def compute_metrics_for_pair(
     gt_path: str,
     pred_path: str,
     device: str = 'cuda',
     use_perceptual: bool = False,
     perceptual_network: str = 'alex',
-    is_fake_3d: bool = True
+    is_fake_3d: bool = True,
+    mask_names: Optional[Sequence[str]] = None,
+    eval_stacks: Optional[Sequence[str]] = None,
+    mask_mode: str = "missing",
+    mask_threshold: float = 0.5,
 ) -> Dict[str, float]:
     """
     Compute all metrics for a prediction-ground truth pair.
@@ -180,15 +344,42 @@ def compute_metrics_for_pair(
     # Load volumes
     gt_volume = load_nifti_volume(gt_path)
     pred_volume = load_nifti_volume(pred_path)
+    eval_mask = load_eval_mask(
+        subject_dir=os.path.dirname(gt_path),
+        mask_names=mask_names,
+        eval_stacks=eval_stacks,
+        mask_mode=mask_mode,
+        mask_threshold=mask_threshold,
+    )
 
     # Handle shape mismatch
-    if gt_volume.shape != pred_volume.shape:
+    shapes = [gt_volume.shape, pred_volume.shape]
+    if eval_mask is not None:
+        shapes.append(eval_mask.shape)
+
+    if len(set(shapes)) > 1:
         logging.warning(
-            f"Shape mismatch: GT {gt_volume.shape} vs Pred {pred_volume.shape}. "
+            f"Shape mismatch: GT {gt_volume.shape}, Pred {pred_volume.shape}"
+            f"{', Mask ' + str(eval_mask.shape) if eval_mask is not None else ''}. "
             f"Applying center crop."
         )
-        gt_volume, pred_volume = center_crop_to_match(gt_volume, pred_volume)
+        cropped = center_crop_to_common(
+            [gt_volume, pred_volume] if eval_mask is None else [gt_volume, pred_volume, eval_mask]
+        )
+        gt_volume, pred_volume = cropped[0], cropped[1]
+        if eval_mask is not None:
+            eval_mask = cropped[2].astype(bool)
         logging.info(f"Cropped to shape: {gt_volume.shape}")
+
+    if eval_mask is not None:
+        return compute_masked_metrics(
+            pred_volume=pred_volume,
+            gt_volume=gt_volume,
+            eval_mask=eval_mask,
+            use_perceptual=use_perceptual,
+            perceptual_network=perceptual_network,
+            is_fake_3d=is_fake_3d,
+        )
 
     # Convert to tensors
     gt_tensor = torch.from_numpy(gt_volume).float().unsqueeze(0).unsqueeze(0)
@@ -256,7 +447,9 @@ def save_csv_results(
         output_path: Path to save CSV file
     """
     # Create output directory if it doesn't exist
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
 
     with open(output_path, 'w', newline='') as f:
         writer = csv.writer(f)
@@ -310,7 +503,9 @@ def save_json_results(
         metadata: Additional metadata to include
     """
     # Create output directory if it doesn't exist
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
 
     output_data = {
         'metadata': metadata,
@@ -361,6 +556,13 @@ Examples:
     --prediction_name model1_sr.nii.gz \
     --output_csv model1_metrics.csv \
     --output_json model1_metrics.json
+
+  # Evaluate only regions supported by the axial stack
+  python evaluate.py \
+    --test_dir /data/test \
+    --prediction_name eclare_prediction.nii.gz \
+    --output_csv eclare_masked_metrics.csv \
+    --eval_stacks axial
 """
     )
 
@@ -375,6 +577,20 @@ Examples:
                         help='Path to save CSV results')
     parser.add_argument('--output_json', type=str,
                         help='Path to save JSON results (optional)')
+
+    # Optional mask-aware evaluation
+    parser.add_argument('--mask_names', type=str, nargs='+',
+                        help='Optional FOV/support mask filename(s) in each subject directory. '
+                             'Valid regions are unioned across masks.')
+    parser.add_argument('--eval_stacks', type=str, nargs='+',
+                        choices=['axial', 'coronal', 'sagittal'],
+                        help='Optional stack names used by the method. Resolves standard FOV mask '
+                             'filenames and evaluates only supported regions.')
+    parser.add_argument('--mask_mode', type=str, default='missing',
+                        choices=['missing', 'valid'],
+                        help='Mask encoding: missing means 1=missing/0=valid; valid means 1=valid/0=missing')
+    parser.add_argument('--mask_threshold', type=float, default=0.5,
+                        help='Threshold used to binarize mask values')
 
     # Perceptual loss arguments
     parser.add_argument('--use_perceptual', action='store_true',
@@ -414,6 +630,12 @@ def main():
     logging.info(f"Prediction name: {args.prediction_name}")
     logging.info(f"Ground truth name: {args.gt_name}")
     logging.info(f"Device: {args.device}")
+    if args.mask_names or args.eval_stacks:
+        logging.info(f"Mask names: {args.mask_names}")
+        logging.info(f"Eval stacks: {args.eval_stacks}")
+        logging.info(f"Mask mode: {args.mask_mode}, threshold: {args.mask_threshold}")
+    else:
+        logging.info("Mask-aware evaluation: disabled (full-volume metrics)")
 
     # Find all subject pairs
     logging.info("\nSearching for subject pairs...")
@@ -437,7 +659,11 @@ def main():
                 device=args.device,
                 use_perceptual=args.use_perceptual,
                 perceptual_network=args.perceptual_network,
-                is_fake_3d=args.perceptual_fake_3d
+                is_fake_3d=args.perceptual_fake_3d,
+                mask_names=args.mask_names,
+                eval_stacks=args.eval_stacks,
+                mask_mode=args.mask_mode,
+                mask_threshold=args.mask_threshold,
             )
 
             volume_results.append(metrics)
@@ -479,7 +705,11 @@ def main():
             'device': args.device,
             'use_perceptual': args.use_perceptual,
             'perceptual_network': args.perceptual_network if args.use_perceptual else None,
-            'perceptual_fake_3d': args.perceptual_fake_3d if args.use_perceptual else None
+            'perceptual_fake_3d': args.perceptual_fake_3d if args.use_perceptual else None,
+            'mask_names': args.mask_names,
+            'eval_stacks': args.eval_stacks,
+            'mask_mode': args.mask_mode,
+            'mask_threshold': args.mask_threshold,
         }
         save_json_results(
             volume_results=volume_results,
