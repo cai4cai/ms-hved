@@ -174,8 +174,10 @@ mshved_*/
 mshved++_*/
 output/
 full_evaluations/
-mask_evaluations/
+mask_*/
 new_evaluations/
+ablation_*/
+hf_space/
 paper/
 paper_journal/
 paper_journal_old/

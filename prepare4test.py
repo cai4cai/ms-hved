@@ -1,31 +1,20 @@
 #!/usr/bin/env python3
-"""MRI preprocessing with FOV mask generation.
+"""MRI preprocessing with FOV mask generation
 
-After registration, each stack's geometry is compared against the HR reference
-grid to produce a binary FOV mask (1=missing, 0=valid) that captures which
-HR voxels fall outside each stack's native field of view.
+We keep the axial (or any chosen stack) as the registration target, but build a
+synthetic axis-aligned RAS reference grid whose field of view is the *union* of
+all input stacks' world-space bounding boxes. Every registered stack, its
+support mask, and its FOV mask are then sampled onto this union grid, so the
+full head is preserved.
 
-These masks are saved alongside the preprocessed stacks and can be passed
-to the MS-HVED model at inference time for precision-weighted fusion.
-
-Pipeline: resample → register → compute FOV masks
+Pipeline: resample → build union grid → register (sample onto union grid) → FOV masks
 
 Usage:
-  # Basic — 3 stacks + external fixed reference
-  python prepare4test.py -i ax.nii.gz cor.nii.gz sag.nii.gz \\
-      -o out/ --fixed-path hr.nii.gz -v
+  # 3 stacks, no external reference — axial (index 0) used as registration target
+  python prepare4test.py -i ax.nii.gz cor.nii.gz sag.nii.gz -o out/ -v
 
-  # With edge trimming
-  python prepare4test.py -i ax.nii.gz cor.nii.gz sag.nii.gz \\
-      -o out/ --fixed-path hr.nii.gz --trim-first 2 --trim-last 2 -v
-
-  # Skip FOV mask generation (behaves like original prepare4test.py)
-  python prepare4test.py -i ax.nii.gz cor.nii.gz sag.nii.gz \\
-      -o out/ --fixed-path hr.nii.gz --no-fov-masks -v
-
-  # Use SimpleITK for the initial spacing/orientation resampling
-  python prepare4test.py -i ax.nii.gz cor.nii.gz sag.nii.gz \\
-      -o out/ --fixed-path hr.nii.gz --resampler simpleitk -v
+  # Choose which input is the registration target
+  python prepare4test.py -i ax.nii.gz cor.nii.gz sag.nii.gz -o out/ --fixed 0 -v
 """
 
 import argparse
@@ -96,12 +85,7 @@ def _sitk_interpolator(interp: str):
 
 
 def _sitk_image_to_ras_affine(img) -> np.ndarray:
-    """Build a nibabel RAS affine from a SimpleITK image.
-
-    SimpleITK stores physical coordinates in LPS. NIfTI/nibabel affines are
-    conventionally interpreted in RAS, so both the direction matrix and origin
-    need an LPS -> RAS conversion.
-    """
+    """Build a nibabel RAS affine from a SimpleITK image."""
     direction_lps = np.asarray(img.GetDirection(), dtype=np.float64).reshape(3, 3)
     spacing = np.asarray(img.GetSpacing(), dtype=np.float64)
     origin_lps = np.asarray(img.GetOrigin(), dtype=np.float64)
@@ -142,7 +126,6 @@ def resample_simpleitk(path: str, resolution: list, orientation: str = "RAS",
     resampler.SetDefaultPixelValue(0.0)
     out_img = resampler.Execute(img)
 
-    # SimpleITK arrays are z, y, x; nibabel expects x, y, z for the affine.
     data = np.transpose(sitk.GetArrayFromImage(out_img), (2, 1, 0)).astype(np.float32)
     affine = _sitk_image_to_ras_affine(out_img)
     header = nib.load(path).header.copy()
@@ -167,13 +150,87 @@ def save_nifti(data: np.ndarray, affine: np.ndarray, header, path: str):
     nib.save(nib.Nifti1Image(data.astype(np.float32), affine, header), path)
 
 
+# ========== UNION-FOV REFERENCE GRID ==========
+
+def build_union_reference_grid(paths: list, resolution: list, out_path: str,
+                               orientation: str = "RAS", verbose: bool = False) -> str:
+    """Create an empty axis-aligned RAS grid spanning the union of all inputs' FOVs.
+
+    The grid's world-space bounding box is the union of the world-space bounding
+    boxes of every image in *paths*. Output is an all-zero NIfTI used only as a
+    geometry reference (shape + affine) for ANTs ``apply_transforms``.
+
+    The grid is built axis-aligned in RAS world coordinates with positive
+    direction cosines and isotropic-or-anisotropic spacing equal to *resolution*.
+    Building it in world space means oblique input stacks are correctly enclosed.
+
+    Note: the grid is always RAS-oriented (positive diagonal). The *orientation*
+    argument is accepted for API symmetry but a non-RAS request only changes
+    voxel ordering, not coverage, so it is ignored with a warning.
+    """
+    if orientation.upper() != "RAS":
+        warnings.warn(
+            f"union reference grid is always built RAS; requested '{orientation}' "
+            "affects voxel ordering only and is ignored.",
+            UserWarning, stacklevel=2,
+        )
+
+    spacing = np.asarray(resolution, dtype=np.float64)
+    mins = None
+    maxs = None
+    for p in paths:
+        img = nib.load(p)
+        nx, ny, nz = (int(s) for s in img.shape[:3])
+        # 8 voxel-index corners (first and last voxel along each axis)
+        idx = np.array(
+            [[i, j, k, 1]
+             for i in (0, nx - 1)
+             for j in (0, ny - 1)
+             for k in (0, nz - 1)],
+            dtype=np.float64,
+        ).T  # (4, 8)
+        world = (img.affine @ idx)[:3].T  # (8, 3) RAS world coords
+        cmin, cmax = world.min(axis=0), world.max(axis=0)
+        mins = cmin if mins is None else np.minimum(mins, cmin)
+        maxs = cmax if maxs is None else np.maximum(maxs, cmax)
+
+    # Half-voxel pad so the outermost voxel centers are fully inside the box.
+    mins = mins - spacing / 2.0
+    maxs = maxs + spacing / 2.0
+
+    shape = np.maximum(np.ceil((maxs - mins) / spacing).astype(int) + 1, 1)
+
+    affine = np.eye(4, dtype=np.float64)
+    affine[:3, :3] = np.diag(spacing)      # RAS, positive direction cosines
+    affine[:3, 3] = mins                   # origin at the min corner
+
+    grid = nib.Nifti1Image(
+        np.zeros(tuple(int(s) for s in shape), dtype=np.float32), affine
+    )
+    nib.save(grid, out_path)
+
+    if verbose:
+        print(f"  Union grid: shape {tuple(int(s) for s in shape)}, "
+              f"spacing {tuple(float(v) for v in spacing)} mm, "
+              f"origin {tuple(round(float(v), 1) for v in mins)}")
+    return out_path
+
+
 # ========== REGISTRATION ==========
 
-def register_to_fixed(fixed_path: str, moving_path: str,
+def register_to_fixed(reg_target_path: str, moving_path: str,
+                      reference_grid_path: str | None = None,
                       transform_type: str = "Rigid",
                       metric: str = "gc") -> tuple:
-    """Register moving image to fixed using ANTs."""
-    fixed = ants.image_read(fixed_path)
+    """Register *moving* to *reg_target* and sample the result onto a chosen grid.
+
+    The registration aligns ``moving`` to ``reg_target`` (the content target).
+    The warped output is then resampled onto ``reference_grid_path`` instead of
+    the registration target's grid — this is what prevents the output from being
+    cropped to a small reference's FOV. If ``reference_grid_path`` is None, the
+    registration target's grid is used (original behavior).
+    """
+    fixed = ants.image_read(reg_target_path)
     moving = ants.image_read(moving_path)
 
     result = ants.registration(
@@ -183,9 +240,34 @@ def register_to_fixed(fixed_path: str, moving_path: str,
         aff_metric=metric,
     )
 
+    ref = ants.image_read(reference_grid_path) if reference_grid_path else fixed
+    warped = ants.apply_transforms(
+        fixed=ref,
+        moving=moving,
+        transformlist=result['fwdtransforms'],
+        interpolator='linear',
+    )
+
     out_path = moving_path.replace('.nii', '_registered.nii')
-    result['warpedmovout'].to_filename(out_path)
+    warped.to_filename(out_path)
     return out_path, result['fwdtransforms']
+
+
+def resample_to_grid(moving_path: str, reference_grid_path: str, out_path: str,
+                     interpolator: str = 'linear') -> str:
+    """Resample *moving* onto *reference_grid* with an identity transform.
+
+    Used for the registration-target stack itself (no transform to apply) so it
+    is placed on the same union grid as everything else, padded with zeros where
+    it has no coverage.
+    """
+    moving = ants.image_read(moving_path)
+    grid = ants.image_read(reference_grid_path)
+    warped = ants.apply_transforms(
+        fixed=grid, moving=moving, transformlist=[], interpolator=interpolator,
+    )
+    warped.to_filename(out_path)
+    return out_path
 
 
 def _ras_spacing(path: str) -> tuple:
@@ -200,30 +282,30 @@ def _ras_spacing(path: str) -> tuple:
     return tuple(ras)
 
 
-def warp_to_orig_res(orig_path, fixed_ants, transforms, out_path):
-    """Apply pre-computed ANTs transforms to *orig_path* at its native voxel spacing."""
+def warp_to_orig_res(orig_path, grid_ants, transforms, out_path):
+    """Apply pre-computed ANTs transforms to *orig_path* at its native spacing.
+
+    The reference is the union grid resampled to the original stack's RAS
+    spacing, so the original-resolution output also spans the full union FOV.
+    """
     orig = ants.image_read(orig_path)
     ras_sp = _ras_spacing(orig_path)
-    ref = ants.resample_image(fixed_ants, ras_sp, use_voxels=False, interp_type=0)
+    ref = ants.resample_image(grid_ants, ras_sp, use_voxels=False, interp_type=0)
     warped = ants.apply_transforms(
         fixed=ref, moving=orig, transformlist=transforms, interpolator='linear',
     )
     warped.to_filename(out_path)
 
 
-def apply_registration_to_support(support_path: str, fixed_path: str,
+def apply_registration_to_support(support_path: str, reference_grid_path: str,
                                   transforms: list | None, out_path: str) -> str:
-    """Apply image registration transforms to a binary support mask."""
-    if not transforms:
-        nib.save(nib.load(support_path), out_path)
-        return out_path
-
-    fixed = ants.image_read(fixed_path)
+    """Resample a binary support mask onto the union grid (with optional transform)."""
+    grid = ants.image_read(reference_grid_path)
     moving = ants.image_read(support_path)
     warped = ants.apply_transforms(
-        fixed=fixed,
+        fixed=grid,
         moving=moving,
-        transformlist=transforms,
+        transformlist=transforms if transforms else [],
         interpolator='nearestNeighbor',
     )
     warped.to_filename(out_path)
@@ -306,70 +388,6 @@ def support_to_fov_mask(support_path: str, reference_path: str) -> np.ndarray:
     valid = (support > 0.5).astype(np.float32)
     return 1.0 - valid
 
-def compute_fov_mask(stack_path: str, original_input_path: str,
-                     hr_reference_path: str, verbose: bool = False) -> np.ndarray:
-    """Compute FOV mask for a registered stack against the HR reference grid.
-
-    The mask is computed by resampling an all-ones volume from the stack's
-    native (pre-registration) geometry to the HR reference grid. Voxels in
-    the HR grid that fall outside the stack's original FOV become 0; after
-    inversion, the FOV mask is 1=missing, 0=valid.
-
-    This captures the obliqueness and limited through-plane coverage of each
-    acquisition stack.
-
-    Args:
-        stack_path: Path to the registered (preprocessed) stack — used only
-                    for shape reference.
-        original_input_path: Path to the original input stack (before any
-                    resampling/registration). The native affine from this
-                    file encodes the acquisition geometry.
-        hr_reference_path: Path to the HR reference volume. Defines the
-                    target grid (shape + affine).
-        verbose: Print diagnostic info.
-
-    Returns:
-        FOV mask as numpy array with the HR reference shape. 1=missing, 0=valid.
-    """
-    # Load original stack geometry
-    orig_img = nib.load(original_input_path)
-    orig_data = orig_img.get_fdata(dtype=np.float32)
-    orig_affine = orig_img.affine.astype(np.float32)
-
-    # Load HR reference geometry
-    hr_img = nib.load(hr_reference_path)
-    hr_shape = hr_img.shape[:3]
-    hr_affine = hr_img.affine.astype(np.float32)
-
-    if verbose:
-        orig_spacing = np.sqrt((orig_affine[:3, :3] ** 2).sum(axis=0))
-        print(f"    Native shape: {orig_data.shape[:3]}, "
-              f"spacing: [{orig_spacing[0]:.2f}, {orig_spacing[1]:.2f}, {orig_spacing[2]:.2f}] mm")
-        print(f"    HR grid shape: {hr_shape}")
-
-    # Convert to torch
-    if orig_data.ndim == 3:
-        lr_volume = torch.from_numpy(orig_data).unsqueeze(0)  # (1, D, H, W)
-    else:
-        lr_volume = torch.from_numpy(orig_data[..., 0]).unsqueeze(0)
-
-    lr_affine_t = torch.from_numpy(orig_affine)
-    hr_affine_t = torch.from_numpy(hr_affine)
-
-    # Compute FOV mask via dummy mask trick
-    _, fov_mask = resample_with_fov_mask(
-        lr_volume, lr_affine_t, hr_affine_t, hr_shape, mode="bilinear"
-    )
-
-    fov_mask_np = fov_mask[0].numpy()  # (D, H, W)
-
-    if verbose:
-        n_missing = (fov_mask_np > 0.5).sum()
-        n_total = fov_mask_np.size
-        print(f"    FOV mask: {n_missing}/{n_total} missing ({100 * n_missing / n_total:.1f}%)")
-
-    return fov_mask_np
-
 
 # ========== PIPELINE ==========
 
@@ -393,7 +411,7 @@ def run_pipeline(
     save_original_res: bool = False,
     verbose: bool = False,
 ):
-    """Run preprocessing pipeline: resample → register → (trim edges) → FOV masks."""
+    """Run preprocessing: resample → union grid → register → (trim) → FOV masks."""
     resolution = resolution or [1.0, 1.0, 1.0]
     iso_resolution = [1.0, 1.0, 1.0]
     os.makedirs(output_dir, exist_ok=True)
@@ -437,12 +455,13 @@ def run_pipeline(
         if do_fov_masks:
             support_paths = resampled_support
 
-    # Stage 2: Register
+    # Stage 2: Build union grid + register onto it
     fwd_transforms = [None] * len(inputs)
-    reg_fixed_ants = None
-    hr_reference_for_fov = None  # Path to the HR reference used for FOV mask computation
+    grid_ants = None
+    hr_reference_for_fov = None  # union grid path
 
     if do_register:
+        # Determine the registration *target* (content to align to).
         if fixed_path is not None:
             fixed_stem = Path(fixed_path).stem.replace('.nii', '')
             if resample_fixed:
@@ -453,55 +472,77 @@ def run_pipeline(
                 )
                 fixed_tmp = os.path.join(temp_dir, "fixed_resampled.nii.gz")
                 save_nifti(data, affine, header, fixed_tmp)
-                reg_fixed = fixed_tmp
-                fixed_out = os.path.join(output_dir, f"{fixed_stem}.nii.gz")
-                save_nifti(data, affine, header, fixed_out)
-                hr_reference_for_fov = fixed_out
-                if verbose:
-                    print(f"  Saved resampled fixed: {Path(fixed_out).name}")
+                reg_target = fixed_tmp
             else:
-                reg_fixed = fixed_path
-                fixed_out = os.path.join(output_dir, f"{fixed_stem}.nii.gz")
-                nib.save(nib.load(fixed_path), fixed_out)
-                hr_reference_for_fov = fixed_out
-                if verbose:
-                    print(f"  Saved fixed: {Path(fixed_out).name}")
+                reg_target = fixed_path
+            fixed_out = os.path.join(output_dir, f"{fixed_stem}.nii.gz")
+            nib.save(nib.load(reg_target), fixed_out)
             if verbose:
-                print(f"=== Registering to external fixed: {Path(reg_fixed).name} ===")
+                print(f"  Saved registration target: {Path(fixed_out).name}")
+            target_idx = None
+            grid_sources = list(current) + [reg_target]
         else:
-            idx = fixed_idx if fixed_idx is not None else 0
-            reg_fixed = current[idx]
-            hr_reference_for_fov = reg_fixed
+            target_idx = fixed_idx if fixed_idx is not None else 0
+            reg_target = current[target_idx]
+            grid_sources = list(current)
             if verbose:
-                print(f"=== Registering to input image index {idx} ===")
+                print(f"=== Registration target: input image index {target_idx} ===")
 
-        reg_fixed_ants = ants.image_read(reg_fixed)
+        # Build the union-FOV reference grid that defines the OUTPUT geometry.
+        if verbose:
+            print("=== Building union-FOV reference grid ===")
+        union_grid = os.path.join(temp_dir, "union_grid.nii.gz")
+        build_union_reference_grid(grid_sources, resolution, union_grid,
+                                   orientation, verbose)
+        grid_out = os.path.join(output_dir, "reference_grid.nii.gz")
+        nib.save(nib.load(union_grid), grid_out)
+        hr_reference_for_fov = union_grid
+        grid_ants = ants.image_read(union_grid)
+
+        if verbose:
+            print(f"=== Registering (output sampled onto union grid) ===")
 
         registered = []
         registered_support = []
         for i, path in enumerate(current):
-            if fixed_path is None and i == (fixed_idx if fixed_idx is not None else 0):
-                registered.append(path)
+            is_target = (fixed_path is None and i == target_idx)
+            if is_target:
+                # No transform — just place the target stack onto the union grid.
+                if verbose:
+                    print(f"  {Path(path).name} (target) -> union grid")
+                grid_path = os.path.join(temp_dir, f"registered_{i}.nii.gz")
+                resample_to_grid(path, union_grid, grid_path, interpolator='linear')
+                registered.append(grid_path)
                 if do_fov_masks:
-                    registered_support.append(support_paths[i])
+                    support_out = os.path.join(temp_dir, f"support_registered_{i}.nii.gz")
+                    resample_to_grid(support_paths[i], union_grid, support_out,
+                                     interpolator='nearestNeighbor')
+                    registered_support.append(support_out)
             else:
                 if verbose:
-                    print(f"  {Path(path).name} -> fixed")
-                reg_path, transforms = register_to_fixed(reg_fixed, path, transform_type, metric)
+                    print(f"  {Path(path).name} -> target, sampled onto union grid")
+                reg_path, transforms = register_to_fixed(
+                    reg_target, path, union_grid, transform_type, metric
+                )
                 fwd_transforms[i] = transforms
                 registered.append(reg_path)
                 if do_fov_masks:
                     support_out = os.path.join(temp_dir, f"support_registered_{i}.nii.gz")
                     apply_registration_to_support(
-                        support_paths[i], reg_fixed, transforms, support_out
+                        support_paths[i], union_grid, transforms, support_out
                     )
                     registered_support.append(support_out)
         current = registered
         if do_fov_masks:
             support_paths = registered_support
     else:
-        # No registration — use first input as reference for FOV masks
-        hr_reference_for_fov = current[0]
+        # No registration — still build a union grid so FOV masks span the head.
+        if verbose:
+            print("=== Building union-FOV reference grid (no registration) ===")
+        union_grid = os.path.join(temp_dir, "union_grid.nii.gz")
+        build_union_reference_grid(current, resolution, union_grid, orientation, verbose)
+        nib.save(nib.load(union_grid), os.path.join(output_dir, "reference_grid.nii.gz"))
+        hr_reference_for_fov = union_grid
 
     # Stage 3: Save outputs (with optional edge trimming)
     do_trim = trim_first > 0 or trim_last > 0
@@ -530,7 +571,7 @@ def run_pipeline(
             print(f"  Saved: {out_path}")
         final_outputs.append(out_path)
 
-    # Stage 4: Compute FOV masks
+    # Stage 4: Compute FOV masks (reference = union grid)
     if do_fov_masks and hr_reference_for_fov is not None:
         if verbose:
             print("=== Computing FOV masks ===")
@@ -545,7 +586,8 @@ def run_pipeline(
             if verbose:
                 n_missing = int((fov_mask > 0.5).sum())
                 n_total = fov_mask.size
-                print(f"    FOV mask: {n_missing}/{n_total} missing ({100 * n_missing / n_total:.1f}%)")
+                print(f"    FOV mask: {n_missing}/{n_total} missing "
+                      f"({100 * n_missing / n_total:.1f}%)")
                 print(f"    Saved: {mask_path}")
 
     # Optional: re-apply transforms to original-resolution inputs
@@ -558,16 +600,18 @@ def run_pipeline(
             if transforms is not None:
                 if verbose:
                     print(f"  {Path(orig).name} -> {Path(orig_res_path).name}")
-                warp_to_orig_res(orig, reg_fixed_ants, transforms, orig_res_path)
+                warp_to_orig_res(orig, grid_ants, transforms, orig_res_path)
             else:
-                orig_ants = ants.image_read(orig)
-                registered_ants = ants.image_read(out_path)
-                warped_orig_res = ants.resample_image(
-                    registered_ants, orig_ants.spacing, use_voxels=False, interp_type=0
+                # Target stack: identity-resample onto the union grid at orig spacing.
+                ras_sp = _ras_spacing(orig)
+                ref = ants.resample_image(grid_ants, ras_sp, use_voxels=False, interp_type=0)
+                warped_orig_res = ants.apply_transforms(
+                    fixed=ref, moving=ants.image_read(orig),
+                    transformlist=[], interpolator='linear',
                 )
                 warped_orig_res.to_filename(orig_res_path)
                 if verbose:
-                    print(f"  {Path(orig).name} (fixed) -> {Path(orig_res_path).name}")
+                    print(f"  {Path(orig).name} (target) -> {Path(orig_res_path).name}")
 
     print(f"Done: {len(inputs)} images -> {output_dir}")
 
@@ -576,43 +620,35 @@ def run_pipeline(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="MRI preprocessing with FOV mask generation: resample -> register -> FOV masks",
+        description="MRI preprocessing with union-FOV reference grid: "
+                    "resample -> union grid -> register -> FOV masks",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Full pipeline with FOV masks
-  python prepare4test.py -i ax.nii.gz cor.nii.gz sag.nii.gz -o out/ --fixed-path hr.nii.gz -v
-
-  # With edge trimming
-  python prepare4test.py -i ax.nii.gz cor.nii.gz sag.nii.gz -o out/ --fixed-path hr.nii.gz --trim-first 2 --trim-last 2 -v
-
-  # Skip FOV mask generation
-  python prepare4test.py -i ax.nii.gz cor.nii.gz sag.nii.gz -o out/ --fixed-path hr.nii.gz --no-fov-masks -v
-
-  # Without external fixed (uses first input as reference)
+  # 3 stacks, axial (index 0) as registration target, output spans union FOV
   python prepare4test.py -i ax.nii.gz cor.nii.gz sag.nii.gz -o out/ -v
 
-  # Save at original resolution too
-  python prepare4test.py -i ax.nii.gz cor.nii.gz sag.nii.gz -o out/ --fixed-path hr.nii.gz --save-original-res -v
+  # Choose a different registration target
+  python prepare4test.py -i ax.nii.gz cor.nii.gz sag.nii.gz -o out/ --fixed 2 -v
         """
     )
     parser.add_argument("-i", "--inputs", nargs="+", required=True,
                         help="Input NIfTI files (low-res stacks)")
-    parser.add_argument("-o", "--output", required=True,
-                        help="Output directory")
-    parser.add_argument("-r", "--resolution", nargs=3, type=float, default=[1.0, 1.0, 1.0],
-                        metavar=("X", "Y", "Z"), help="Target voxel resolution in mm (default: 1 1 1)")
+    parser.add_argument("-o", "--output", required=True, help="Output directory")
+    parser.add_argument("-r", "--resolution", nargs=3, type=float, default=[0.5, 0.5, 0.5],
+                        metavar=("X", "Y", "Z"),
+                        help="Target voxel resolution in mm (default: 1 1 1)")
     parser.add_argument("--orientation", default="RAS",
-                        help="Target orientation (default: RAS)")
+                        help="Target orientation for resampling (default: RAS)")
     parser.add_argument("--interp", choices=["trilinear", "bilinear", "nearest"],
                         default="trilinear",
                         help="Interpolation mode for MONAI/SimpleITK (default: trilinear)")
     parser.add_argument("--resampler", choices=["monai", "nilearn", "simpleitk"], default="monai",
                         help="Resampling backend (default: monai)")
     parser.add_argument("--fixed", type=int, default=None,
-                        help="Index of input image to use as fixed for registration (default: 0)")
+                        help="Index of input image to use as registration target (default: 0)")
     parser.add_argument("--fixed-path", type=str, default=None,
-                        help="Path to an external 3D volume to use as fixed for registration")
+                        help="Path to an external 3D volume to use as registration target")
     parser.add_argument("--resample-fixed", action="store_true",
                         help="Resample --fixed-path to 1 mm isotropic before registration")
     parser.add_argument("--transform", choices=["Rigid", "Affine"], default="Rigid",

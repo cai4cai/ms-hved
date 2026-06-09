@@ -32,6 +32,7 @@ from typing import Dict, Any, List, Optional, Sequence
 import numpy as np
 import torch
 import nibabel as nib
+from monai.metrics import MultiScaleSSIMMetric
 from tqdm import tqdm
 
 # Import metrics from project
@@ -254,6 +255,13 @@ def compute_ncc(pred: np.ndarray, gt: np.ndarray) -> float:
     return float(ncc)
 
 
+def compute_ms_ssim(pred: torch.Tensor, target: torch.Tensor, max_val: float = 1.0) -> float:
+    """Compute MONAI multi-scale structural similarity for 3D volumes."""
+    with torch.no_grad():
+        ms_ssim_metric = MultiScaleSSIMMetric(spatial_dims=3, data_range=max_val)
+        return float(ms_ssim_metric(pred, target).item())
+
+
 def compute_masked_metrics(
     pred_volume: np.ndarray,
     gt_volume: np.ndarray,
@@ -305,6 +313,7 @@ def compute_masked_metrics(
         is_fake_3d=is_fake_3d,
     )
     metrics["ssim"] = spatial_metrics["ssim"]
+    # metrics["ms_ssim"] = compute_ms_ssim(pred_tensor, gt_tensor, max_val=1.0)
     if "perceptual_loss" in spatial_metrics:
         metrics["perceptual_loss"] = spatial_metrics["perceptual_loss"]
 
@@ -394,6 +403,7 @@ def compute_metrics_for_pair(
         perceptual_network=perceptual_network,
         is_fake_3d=is_fake_3d
     )
+    # metrics["ms_ssim"] = compute_ms_ssim(pred_tensor, gt_tensor, max_val=1.0)
     
     # Compute NCC
     metrics['ncc'] = compute_ncc(pred_volume, gt_volume)
