@@ -635,7 +635,7 @@ Examples:
     parser.add_argument("-i", "--inputs", nargs="+", required=True,
                         help="Input NIfTI files (low-res stacks)")
     parser.add_argument("-o", "--output", required=True, help="Output directory")
-    parser.add_argument("-r", "--resolution", nargs=3, type=float, default=[0.5, 0.5, 0.5],
+    parser.add_argument("-r", "--resolution", nargs=3, type=float, default=[1.0, 1.0, 1.0],
                         metavar=("X", "Y", "Z"),
                         help="Target voxel resolution in mm (default: 1 1 1)")
     parser.add_argument("--orientation", default="RAS",

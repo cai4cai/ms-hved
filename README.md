@@ -1,8 +1,6 @@
-# MS-HVED: A Sequence Agnostic Multi-Scale Hierarchical Variational Encoder-Decoder for Brain MRI Super-Resolution
+# [MS-HVED](https://arxiv_link): A Sequence Agnostic Multi-Scale Hierarchical Variational Encoder-Decoder for Brain MRI Super-Resolution
 
 A deep learning framework for isotropic super-resolution of brain MRI from multiple anisotropic orthogonal acquisitions. MS-HVED fuses axial, coronal, and sagittal low-resolution stacks via a Product-of-Gaussians (PoG) posterior in a multi-scale latent space to produce high-resolution isotropic outputs.
-
-Building on the original MS-HVED, this version introduces a normalization-free architecture with spectral regularization, consistency training across degradation variations, FOV-aware fusion with obliqueness simulation.
 
 ## Architecture
 
@@ -16,12 +14,18 @@ Building on the original MS-HVED, this version introduces a normalization-free a
   <img src="assets/qualitative_results.png" width="90%" />
 </p>
 
-## Pre-trained Models
+## Pre-trained Model 
 
 | Model | Training Data | Link |
 |-------|--------------|------|
-| MS-HVED (T1) | IXI T1 | [Download](https://example.com/placeholder-ixi-t1-model) |
-| MS-HVED (T2) | IXI T2 | [Download](https://example.com/placeholder-ixi-t2-model) |
+| MS-HVED | IXI T1 + IXI T2 + MEN| [Download](https://huggingface.co/marshallhamzah/ms-hved) |
+
+## Try it out
+
+[HF-Space](https://marshallhamzah-ms-hved.hf.space/)
+
+## Study Platform
+[Github repo](https://github.com/Marshall-mk/review-app)
 
 ## Requirements
 
@@ -132,7 +136,7 @@ python test.py \
 
 ## Acknowledgements
 
-This work uses the [IXI dataset](https://brain-development.org/ixi-dataset/), which is available under a CC BY-SA 3.0 license.
+This work was supported by King's College London through the King's Doctoral College Africa Studentship. LG-FM acknowledges funding from the EPSRC Centre for Doctoral Training in Smart Medical Imaging  [grant number EP/S022104/1].
 
 ## Citation
 

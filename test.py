@@ -217,6 +217,7 @@ def load_orthogonal_stacks_from_files(stack_paths, target_res=[1.0, 1.0, 1.0]):
     transforms = create_inference_transforms(target_res)
     lr_stacks_tensors = [None, None, None]
     reference_shape = None
+    reference_affine = None
 
     orientation_mapping = [
         ("Axial", "Stack 0", "High-res in D axis"),
@@ -248,6 +249,18 @@ def load_orthogonal_stacks_from_files(stack_paths, target_res=[1.0, 1.0, 1.0]):
 
         if reference_shape is None:
             reference_shape = volume_np.shape
+            # Capture the affine of the RAS-reoriented, resampled grid straight
+            # from the transformed MetaTensor. This MUST be used for the saved
+            # output: Orientationd has reordered the data array to RAS, so an
+            # affine rebuilt from the *original* orientation (create_isotropic_
+            # affine) would mis-describe it and mirror-flip the result for any
+            # non-RAS input (e.g. LAS acquisitions).
+            if hasattr(volume, "affine") and volume.affine is not None:
+                reference_affine = np.asarray(
+                    volume.affine.cpu() if hasattr(volume.affine, "cpu")
+                    else volume.affine,
+                    dtype=np.float64,
+                )
 
         volume_np = (volume_np - volume_np.min()) / (volume_np.max() - volume_np.min() + 1e-8)
         lr_stacks_tensors[i] = torch.from_numpy(volume_np).float().unsqueeze(0)
@@ -262,9 +275,15 @@ def load_orthogonal_stacks_from_files(stack_paths, target_res=[1.0, 1.0, 1.0]):
             print(f"    Created dummy stack for {orientation_mapping[i][0]}: shape {dummy.shape}")
 
     metadata['shape_isotropic'] = lr_stacks_tensors[0].squeeze().shape
-    metadata['affine_isotropic'] = create_isotropic_affine(
-        target_res, metadata['shape_isotropic'], metadata['affine_original']
-    )
+    if reference_affine is not None:
+        # Correct grid for the RAS-reoriented data (handles non-RAS inputs).
+        metadata['affine_isotropic'] = reference_affine
+    else:
+        # Fallback (e.g. MetaTensor without affine): only correct if the input
+        # was already RAS, but preserves the previous behaviour.
+        metadata['affine_isotropic'] = create_isotropic_affine(
+            target_res, metadata['shape_isotropic'], metadata['affine_original']
+        )
 
     print(f"    Final stack shapes: {[s.shape for s in lr_stacks_tensors]}")
     return lr_stacks_tensors, metadata
