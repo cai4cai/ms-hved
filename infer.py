@@ -624,8 +624,12 @@ if __name__ == "__main__":
         fov_overrides["fov_transition_width"] = args.fov_transition_width
     residual_override = True if args.global_residual else (False if args.no_global_residual else None)
 
+    # Bind the real loader now. Folder mode below rebinds the module-global name to
+    # this wrapper, so resolving it by name here would make the wrapper call itself.
+    _load_checkpoint = load_mshved_from_checkpoint
+
     def load_with_overrides(checkpoint_path, device="cuda"):
-        model, checkpoint = load_mshved_from_checkpoint(checkpoint_path, device)
+        model, checkpoint = _load_checkpoint(checkpoint_path, device)
         if fov_overrides:
             fusion_module = model.fusion.fusion  # MultiScaleFusion -> ProductOfGaussians
             for k, v in fov_overrides.items():

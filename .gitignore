@@ -181,6 +181,7 @@ hf_space/
 paper/
 paper_journal/
 paper_journal_old/
+utils/
 # IDE specific files
 .vscode/
 .idea/
