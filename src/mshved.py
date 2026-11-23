@@ -243,10 +243,14 @@ class MSHVED(nn.Module):
         encoder_outputs: List[Dict[str, Dict[int, torch.Tensor]]],
         orientation_mask: Optional[torch.Tensor] = None,
         fov_masks: Optional[List[torch.Tensor]] = None,
-        deterministic: bool = False
+        deterministic: bool = False,
+        *,
+        return_posteriors: bool = True,
     ) -> Tuple[List[torch.Tensor], List[Tuple[torch.Tensor, torch.Tensor]]]:
         """Fuse via Product of Gaussians and sample."""
-        return self.fusion(encoder_outputs, orientation_mask, fov_masks, deterministic)
+        return self.fusion(
+            encoder_outputs, orientation_mask, fov_masks, deterministic, return_posteriors=return_posteriors,
+        )
 
     def decode(
         self,
@@ -265,7 +269,9 @@ class MSHVED(nn.Module):
         orientations: List[torch.Tensor],
         orientation_mask: Optional[torch.Tensor] = None,
         fov_masks: Optional[List[torch.Tensor]] = None,
-        deterministic: bool = False
+        deterministic: bool = False,
+        *,
+        return_posteriors: bool = True,
     ) -> Dict[str, Union[torch.Tensor, List]]:
         """
         Full forward pass.
@@ -276,6 +282,7 @@ class MSHVED(nn.Module):
             fov_masks: List of 3 FOV masks, each (B, 1, D, H, W).
                          1 = missing (out-of-FOV), 0 = valid.
             deterministic: If True, return means without sampling
+            return_posteriors: If False, omit posterior tensors from the returned dict
 
         Returns:
             Dict with 'sr_output', 'orientation_outputs', 'posteriors', 'latent_samples'
@@ -285,7 +292,7 @@ class MSHVED(nn.Module):
 
         # Fuse
         latent_samples, posteriors = self.fuse(
-            encoder_outputs, orientation_mask, fov_masks, deterministic
+            encoder_outputs, orientation_mask, fov_masks, deterministic, return_posteriors=return_posteriors,
         )
 
         # Decode

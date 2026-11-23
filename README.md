@@ -123,6 +123,26 @@ python test.py \
 # Produces: sr_output_sample1.nii.gz ... sr_output_sample5.nii.gz
 ```
 
+### Optional inference acceleration
+
+For `infer.py`, `--compile` compiles the window predictor with PyTorch Inductor,
+and `--triton-pog` enables fused Product-of-Gaussians (PoG) on CUDA. Use either
+flag independently or together:
+
+```bash
+python infer.py \
+  --input_stacks axial.nii.gz coronal.nii.gz sagittal.nii.gz \
+  --fov_masks axial_fov_mask.nii.gz coronal_fov_mask.nii.gz sagittal_fov_mask.nii.gz \
+  --model checkpoint.pth --output sr_output.nii.gz \
+  --amp --compile --triton-pog
+```
+
+Compilation requires PyTorch 2.x. The first call for a new input shape can
+include compilation time. Triton PoG requires a compatible Triton installation
+and `--num_samples 1`. It keeps the existing FOV weighting and uses FP32
+accumulation. Timings and floating-point results can differ from eager inference.
+Neither flag is enabled by default.
+
 ### Missing Orientations
 
 ```bash
