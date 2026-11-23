@@ -18,6 +18,7 @@ This allows the network to handle missing orientations gracefully - we simply
 exclude missing orientations from the sum.
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -72,6 +73,15 @@ class ProductOfGaussians(nn.Module):
         self.smooth_fov = smooth_fov
         self.fov_transition_width = fov_transition_width
         self._kernel_cache: Dict[Tuple[float, str], torch.Tensor] = {}
+        self._triton_fuse = None
+
+    def enable_triton(self) -> None:
+        """Lazily enable optional Triton fusion for CUDA inference."""
+        try:
+            from .triton_pog import fuse_gaussians
+        except ImportError as exc:
+            raise RuntimeError("Triton PoG requires a CUDA PyTorch environment with Triton installed") from exc
+        self._triton_fuse = fuse_gaussians
 
     @staticmethod
     def _make_gaussian_kernel_3d(sigma: float, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -139,7 +149,9 @@ class ProductOfGaussians(nn.Module):
         logvars: Dict[int, torch.Tensor],
         orientation_mask: Optional[torch.Tensor] = None,
         fov_masks: Optional[Dict[int, torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        *,
+        return_logvar: bool = True,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Compute fused posterior via product of Gaussians.
 
@@ -159,6 +171,16 @@ class ProductOfGaussians(nn.Module):
         """
         if len(mus) == 0:
             raise ValueError("At least one orientation must be present")
+
+        if self._triton_fuse is not None and not self.training and not torch.is_grad_enabled():
+            prior_precision = 1.0 / (math.exp(self.prior_logvar) + self.eps) if self.use_prior else 0.0
+            fused = self._triton_fuse(
+                mus, logvars, orientation_mask, fov_masks, self.smooth_fov_mask,
+                prior_precision=prior_precision, prior_weighted_mean=self.prior_mu * prior_precision,
+                eps=self.eps, return_logvar=return_logvar,
+            )
+            if fused is not None:
+                return fused
 
         # Force fp32 — precision-weighted fusion overflows fp16 (max 65504)
         input_dtype = next(iter(mus.values())).dtype
@@ -228,6 +250,8 @@ class ProductOfGaussians(nn.Module):
         posterior_var = 1.0 / (precision_sum + self.eps)
         posterior_mu = weighted_mu_sum * posterior_var
         posterior_mu = torch.clamp(posterior_mu, min=-10.0, max=10.0)
+        if not return_logvar:
+            return posterior_mu.to(input_dtype), None
         posterior_logvar = torch.log(posterior_var + self.eps)
 
         # Safety: Clamp output to prevent NaN propagation
@@ -322,7 +346,9 @@ class MultiScaleFusion(nn.Module):
         encoder_outputs: List[Dict[str, Dict[int, torch.Tensor]]],
         orientation_mask: Optional[torch.Tensor] = None,
         fov_masks: Optional[List[torch.Tensor]] = None,
-        deterministic: bool = False
+        deterministic: bool = False,
+        *,
+        return_posteriors: bool = True,
     ) -> Tuple[List[torch.Tensor], List[Tuple[torch.Tensor, torch.Tensor]]]:
         """
         Fuse and sample at all scales.
@@ -341,6 +367,7 @@ class MultiScaleFusion(nn.Module):
         """
         samples = []
         posteriors = []
+        need_logvar = return_posteriors or (self.sampler.training and not deterministic)
 
         for scale_idx, scale_data in enumerate(encoder_outputs):
             mus = scale_data['mu']
@@ -365,13 +392,14 @@ class MultiScaleFusion(nn.Module):
 
             # Fuse via Product of Gaussians
             fused_mu, fused_logvar = self.fusion(
-                mus, logvars, orientation_mask, fov_masks=scale_fov_masks
+                mus, logvars, orientation_mask, fov_masks=scale_fov_masks, return_logvar=need_logvar,
             )
 
             # Sample
-            z = self.sampler(fused_mu, fused_logvar, deterministic)
+            z = self.sampler(fused_mu, fused_logvar, deterministic) if need_logvar else fused_mu
 
             samples.append(z)
-            posteriors.append((fused_mu, fused_logvar))
+            if return_posteriors:
+                posteriors.append((fused_mu, fused_logvar))
 
         return samples, posteriors

@@ -175,7 +175,8 @@ class MemoryProfiler:
 
 
 def _make_predictor(model, base_orientation_mask, has_fov, num_orientations,
-                    amp=False, amp_dtype=torch.bfloat16, deterministic=True):
+                    amp=False, amp_dtype=torch.bfloat16, deterministic=True,
+                    compile_model=False, triton_pog=False):
     """Build the per-window predictor closure for sliding_window_inference.
 
     The windowed input tensor is the channel-wise concatenation
@@ -205,15 +206,19 @@ def _make_predictor(model, base_orientation_mask, has_fov, num_orientations,
             if amp else torch.autocast(device_type=window.device.type, enabled=False)
         )
         with autocast_ctx:
+            posterior_options = {"return_posteriors": False} if triton_pog else {}
             out = model(
                 stacks,
                 orientation_mask=om,
                 fov_masks=fov_masks,
                 deterministic=deterministic,
+                **posterior_options,
             )
         # Aggregation in MONAI is done in fp32; cast back from any autocast dtype.
         return out["sr_output"].float()
 
+    if compile_model:
+        return torch.compile(predictor, backend="inductor", fullgraph=True, dynamic=False)
     return predictor
 
 
@@ -279,8 +284,16 @@ def predict_single_volume_chunked(
     profile=True,
     profile_windows=False,
     output_scale="unit",
+    compile_model=False,
+    triton_pog=False,
 ):
     """Sliding-window MS-HVED inference for a single set of orthogonal stacks."""
+    if triton_pog:
+        if torch.device(device).type != "cuda" or not torch.cuda.is_available():
+            raise ValueError("Triton PoG requires a CUDA device")
+        if num_samples != 1:
+            raise ValueError("Triton PoG is supported only for deterministic inference (num_samples=1)")
+        model.fusion.fusion.enable_triton()
     num_orientations = getattr(model, "num_orientations", 3)
     profiler = MemoryProfiler(device, enabled=profile, per_window=profile_windows)
 
@@ -342,6 +355,7 @@ def predict_single_volume_chunked(
                 predictor = _make_predictor(
                     model, base_mask, has_fov, num_orientations,
                     amp=amp, amp_dtype=amp_dtype, deterministic=deterministic,
+                    compile_model=compile_model, triton_pog=triton_pog,
                 )
                 profiler.reset()
                 predictor = profiler.wrap_predictor(predictor)
@@ -569,6 +583,10 @@ if __name__ == "__main__":
     parser.add_argument("--amp", action="store_true",
                         help="Autocast convolutions (fusion still runs fp32 internally).")
     parser.add_argument("--amp_dtype", type=str, default="bfloat16", choices=["bfloat16", "float16"])
+    parser.add_argument("--compile", action="store_true", dest="compile_model",
+                        help="Compile the window predictor with PyTorch Inductor (first call compiles).")
+    parser.add_argument("--triton-pog", "--triton_pog", action="store_true",
+                        help="Use Triton PoG for deterministic CUDA inference (requires Triton).")
     parser.add_argument("--gpu_output", action="store_true",
                         help="Keep the output accumulator on GPU (default: CPU, lower GPU memory).")
     parser.add_argument("--output_scale", type=str, default="unit",
@@ -611,6 +629,12 @@ if __name__ == "__main__":
         args.device = "cpu"
     if args.global_residual and args.no_global_residual:
         raise ValueError("--global_residual and --no_global_residual are mutually exclusive.")
+    if args.compile_model and not hasattr(torch, "compile"):
+        parser.error("--compile requires PyTorch 2.x")
+    if args.triton_pog and (torch.device(args.device).type != "cuda" or not torch.cuda.is_available()):
+        parser.error("--triton-pog requires a CUDA device")
+    if args.triton_pog and args.num_samples != 1:
+        parser.error("--triton-pog requires --num_samples 1")
 
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bfloat16" else torch.float16
 
@@ -652,6 +676,8 @@ if __name__ == "__main__":
         profile=not args.no_profile,
         profile_windows=args.profile_windows,
         output_scale=args.output_scale,
+        compile_model=args.compile_model,
+        triton_pog=args.triton_pog,
     )
 
     # ---- Folder mode ----
